@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# xpu-smi dump sidecar: start | stop <csv> <out_json>
+# GPU telemetry sidecar: start | stop <csv> <out_json>
 # start prints "PID CSV_PATH"; stop kills the sampler and summarizes every
 # numeric CSV column (mean/min/max) + duration; a column whose header mentions
 # Power also yields approx_joules = mean_power * duration.
+# Sampler defaults to xpu-smi; override with TELEMETRY_CMD, e.g. on hosts
+# without xpu-smi: TELEMETRY_CMD="sudo intel_gpu_top -c -s 1000"
 set -euo pipefail
 
 CMD="${1:?start|stop}"
@@ -10,12 +12,12 @@ XPU_SMI_BIN="${XPU_SMI_BIN:-xpu-smi}"
 XPU_SMI_DEVICE="${XPU_SMI_DEVICE:-0}"
 # 0=util 1=power 2=freq 3=temp 5=mem-used 18=mem-bandwidth (see xpu-smi dump -h)
 XPU_SMI_METRICS="${XPU_SMI_METRICS:-0,1,2,3,5,18}"
+TELEMETRY_CMD="${TELEMETRY_CMD:-${XPU_SMI_BIN} dump -d ${XPU_SMI_DEVICE} -m ${XPU_SMI_METRICS} -i 1}"
 
 case "${CMD}" in
   start)
     CSV="${2:?csv path}"
-    nohup "${XPU_SMI_BIN}" dump -d "${XPU_SMI_DEVICE}" \
-      -m "${XPU_SMI_METRICS}" -i 1 >"${CSV}" 2>/dev/null &
+    nohup bash -c "exec ${TELEMETRY_CMD}" >"${CSV}" 2>/dev/null &
     echo "$! ${CSV}"
     ;;
   stop)
