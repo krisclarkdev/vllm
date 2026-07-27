@@ -5,15 +5,30 @@ Duplicate-work checks run per AGENTS.md (`gh issue view` / `gh pr list` on
 planned PR series (A–D + kernels track), **only PR-A is new work**. Everything
 else is already open or already merged upstream.
 
+## Required for FA-in-graph graphs PR (#50038)
+
+Treat these as **merge / pin companions** of
+[vllm#50038](https://github.com/vllm-project/vllm/pull/50038) (gating-only).
+They are already open — do not duplicate; land or pin with graphs support:
+
+| Companion | Role |
+|-----------|------|
+| [vllm#48677](https://github.com/vllm-project/vllm/pull/48677) (draft) | torch 2.13 / oneAPI 2026 image — runtime must be ≥ 20260000 for FA-in-graph |
+| [vllm#49813](https://github.com/vllm-project/vllm/pull/49813) | softcap/ALIBI forward + MXFP8 MoE prefer-XPU |
+| [vllm-xpu-kernels#485](https://github.com/vllm-project/vllm-xpu-kernels/pull/485) | Split-K mix-batch decode |
+| [vllm-xpu-kernels#487](https://github.com/vllm-project/vllm-xpu-kernels/pull/487) | fail closed on missing FA2 shapes |
+| [vllm-xpu-kernels#488](https://github.com/vllm-project/vllm-xpu-kernels/pull/488) | native Xe2 MXFP8 / block-FP8 MoE |
+| [vllm-xpu-kernels#489](https://github.com/vllm-project/vllm-xpu-kernels/pull/489) | fail closed on softcap/ALIBI |
+
 ## Already upstream — do not duplicate
 
 | Planned | Status |
 |---------|--------|
-| PR-B: oneAPI 2026.0 + torch 2.13 image bump | **Duplicated** by vllm-project/vllm#48677 ([XPU] upgrade to torch 2.13, yma11, draft; touches `docker/Dockerfile.xpu`, `requirements/xpu.txt`, `requirements/test/xpu.txt`, `setup.py`) and #47709 (oneAPI env sourcing in Dockerfile). Our unique value = the build fixes in `ONEAPI_2026_BUILD_NOTES.md` (2026.0-vs-2026.1 icpx pin, SYCL_HOME for kernels cmake, oneCCL so.9) and A/B metrics — offer as review input on #48677, not a competing PR. |
-| PR-C: `is_padding` removal in `_custom_ops.py` | **Handled by Intel's WA cycle.** Official kernels merged `is_padding` (vllm-project/vllm-xpu-kernels#481, 2026-07-24, after the v0.1.11.1 release that vLLM pins). Upstream is actively adding/removing these WAs (#49395, #49884) and will drop them when the next kernels wheel is pinned. Do not open; revisit only if the WA removal has not landed after the next kernels release. |
-| PR-C: softcap/ALIBI forwarding + PR-D: MXFP8 oracle prefer-XPU | **Already open from this fork:** vllm-project/vllm#49813 ([XPU] Prefer MXFP8 MoE XPU backend; forward softcap/ALIBI). intel-ci **passed**, DCO passed, reviewers cc'd by jikunshang. The only failing check (`pre-run-check`) is a permissions gate: first-time author needs a maintainer to add the `ready` label — human action: ask in the PR / #pr-reviews Slack. |
-| `VLLM_XPU_ATTN_ALLOW_FALLBACK` env | **Not upstreamable now** — read by the fork kernels only (no counterpart in official kernels). Follows the fail-closed kernels PRs below. |
-| Kernels track (fail-closed attn, softcap/ALIBI, Split-K, MXFP8 MoE) | **Already open on vllm-project/vllm-xpu-kernels:** #485 (Split-K mix-batch decode), #487 (fail closed by default on missing FA2 shapes), #488 (native Xe2 MXFP8/block-FP8 MoE), #489 (fail closed on softcap/ALIBI). |
+| PR-B: oneAPI 2026.0 + torch 2.13 image bump | **Required companion of #50038.** Covered by #48677 (draft; yma11). Our unique value = build notes in `ONEAPI_2026_BUILD_NOTES.md` + A/B metrics — review input on #48677, not a competing PR. |
+| PR-C: `is_padding` removal in `_custom_ops.py` | **Handled by Intel's WA cycle.** Official kernels merged `is_padding` (vllm-xpu-kernels#481). Upstream WAs (#49395, #49884) drop when the next kernels wheel is pinned. Do not open. |
+| PR-C: softcap/ALIBI + PR-D: MXFP8 oracle | **Required companion of #50038.** Open as #49813 from this fork. intel-ci passed; may need maintainer `ready` label for first-time author. |
+| `VLLM_XPU_ATTN_ALLOW_FALLBACK` env | **Not upstreamable now** — fork kernels only. Follows fail-closed kernels PRs below. |
+| Kernels track | **Required companions of #50038.** Open: #485, #487, #488, #489. |
 
 ## PR-A — ready to open (the one new contribution)
 
