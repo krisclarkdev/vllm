@@ -21,7 +21,7 @@ TELEMETRY_CMD="${TELEMETRY_CMD:-${XPU_SMI_BIN} dump -d ${XPU_SMI_DEVICE} -m ${XP
 case "${CMD}" in
   start)
     CSV="${2:?csv path}"
-    nohup bash -c "exec ${TELEMETRY_CMD}" >"${CSV}" 2>/dev/null &
+    nohup bash -c "${TELEMETRY_CMD}" >"${CSV}" 2>/dev/null &
     echo "$! ${CSV}"
     ;;
   stop)
