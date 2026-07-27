@@ -16,6 +16,7 @@ server reports them.
 import argparse
 import concurrent.futures
 import json
+import os
 import random
 import statistics
 import sys
@@ -23,12 +24,19 @@ import time
 import urllib.error
 import urllib.request
 
+API_KEY = os.environ.get("BENCH_API_KEY", "")
+
+
+def _headers():
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    return headers
+
 
 def post_json(url, payload, timeout=600):
     req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        url, data=json.dumps(payload).encode(), headers=_headers()
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
@@ -70,7 +78,7 @@ def one_request(base_url, model, prompt, max_tokens, timeout):
     req = urllib.request.Request(
         f"{base_url}/v1/completions",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=_headers(),
     )
     t0 = time.perf_counter()
     ttft = None
