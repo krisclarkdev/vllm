@@ -3,8 +3,12 @@
 # start prints "PID CSV_PATH"; stop kills the sampler and summarizes every
 # numeric CSV column (mean/min/max) + duration; a column whose header mentions
 # Power also yields approx_joules = mean_power * duration.
-# Sampler defaults to xpu-smi; override with TELEMETRY_CMD, e.g. on hosts
-# without xpu-smi: TELEMETRY_CMD="sudo intel_gpu_top -c -s 1000"
+# Sampler defaults to xpu-smi; override with TELEMETRY_CMD. On xe-driver
+# hosts without xpu-smi, use a sysfs loop emitting CSV with an "..._uJ"
+# energy column (cumulative counter -> Joules via max-min), e.g.:
+#   TELEMETRY_CMD='echo energy_card_uJ,energy_pkg_uJ,act_freq_mhz; while :; do
+#     echo "$(cat H/energy1_input),$(cat H/energy2_input),$(cat G/act_freq)";
+#     sleep 1; done'   # H=/sys/class/hwmon/hwmon4 G=.../tile0/gt0/freq0
 set -euo pipefail
 
 CMD="${1:?start|stop}"
@@ -55,6 +59,9 @@ for h, vals in cols.items():
     summary[h] = stat
     if "power" in h.lower():
         summary["approx_joules"] = round(stat["mean"] * duration, 1)
+    if "energy" in h.lower() and "uj" in h.lower():
+        # Cumulative microjoule counter (e.g. xe hwmon energy1_input).
+        summary[f"{h}_joules"] = round((stat["max"] - stat["min"]) / 1e6, 1)
 json.dump(summary, open(out_path, "w"), indent=2)
 print(f"wrote {out_path}")
 PY
