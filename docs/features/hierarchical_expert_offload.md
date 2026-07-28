@@ -95,12 +95,13 @@ identity-style remap with no H2D/disk churn per forward (PR-A metrics still
 recorded as device hits). This is the Colibri-like `PIN_GB=all` analogue.
 
 ```bash
-# Mixtral-8x7B: 8 experts → full residency
+# Mixtral-8x7B: 8 experts → full residency (needs free VRAM after profile)
 vllm serve ... --offload-backend hierarchical --tier-num-slots 8
 ```
 
-Forced staging for bakeoffs: `--tier-num-slots 4` (of 8).
-
+On Arc Pro B70 (~32 GiB) with Mixtral-8x7B AWQ, `slots=8` currently OOMs in
+engine init; use `--tier-num-slots 4` for staging bakeoffs (see
+`hierarchical_expert_offload_eval.md`).
 
 Reservation order: dense resident → KV cache → activation scratch → expert
 slots. Hierarchical weight offload **cannot** be combined with UVA
