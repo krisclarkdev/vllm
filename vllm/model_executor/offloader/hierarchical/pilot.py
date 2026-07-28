@@ -62,7 +62,10 @@ class PilotPrefetcher:
                 logits = gate(h)
                 if isinstance(logits, tuple):
                     logits = logits[0]
-                topk = min(8, logits.shape[-1])
+                topk = min(
+                    int(getattr(state.module, "top_k", 8) or 8),
+                    int(logits.shape[-1]),
+                )
                 _, idx = torch.topk(
                     logits.reshape(-1, logits.shape[-1]), topk, dim=-1
                 )
