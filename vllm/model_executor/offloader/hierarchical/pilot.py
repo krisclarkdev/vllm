@@ -48,6 +48,7 @@ class PilotPrefetcher:
         if next_id not in self.manager.layers:
             return
 
+        state = self.manager.layers[next_id]
         predicted = list(current_expert_ids)
         used_gate = False
         gate = self._gates.get(next_id)
@@ -74,7 +75,6 @@ class PilotPrefetcher:
             except Exception as e:
                 logger.debug("PILOT gate failed for layer %d: %s", next_id, e)
 
-        state = self.manager.layers[next_id]
         local_pred: list[int] = []
         for eid in predicted:
             local = state.to_local(int(eid))
