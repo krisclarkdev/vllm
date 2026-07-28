@@ -62,6 +62,8 @@ vllm serve <moe-model> \
 | `--tier-io-workers N` | Disk→RAM workers (default 8) |
 | `--tier-direct` | Prefer `O_DIRECT` reads |
 | `--tier-usage-path` | Learned usage heat-map path |
+| `--tier-atlas-path` | Optional expert atlas JSON (affinity pins) |
+| `--tier-affinity-topic` | Explicit atlas topic id (v1; no auto detect) |
 | `--tier-dense-prefetch` | Also stage dense attention leftovers |
 | `--tier-num-slots` | Override slots per MoE layer |
 | `--tier-allow-cuda-graphs` | Experimental graphs (default off) |
@@ -218,6 +220,62 @@ checks):**
   drops — disable speculation when warm tok/s with spec < without (see eval doc).
 
 Disable SPEC_PIN only for debugging: `--no-tier-spec-pin`.
+
+## Expert atlas (optional affinity pins)
+
+Offline probes measure which experts fire for which **topics**. At serve time
+you can boost cold-start pins for a session topic. **Atlas never changes
+router outputs or weights** — only which experts are preferred in RAM/device
+slots (placement).
+
+### Build an atlas
+
+```bash
+# Live MoE probes (records hierarchical usage per topic)
+VLLM_ENABLE_V1_MULTIPROCESSING=0 .venv/bin/python \
+  benchmarks/hierarchical_expert_atlas.py \
+  --model /path/to/moe \
+  --probes benchmarks/hierarchical_atlas_probes.example.json \
+  --tier-num-slots 4 --tier-ram-gb 8 \
+  --output /nvme/expert_store/.vllm_expert_atlas.json
+
+# Or merge pre-recorded counts (CI / synthetic)
+.venv/bin/python benchmarks/hierarchical_expert_atlas.py \
+  --merge-json /tmp/atlas_counts.json \
+  --output /tmp/.vllm_expert_atlas.json
+```
+
+Sample schema:
+
+```json
+{
+  "version": 1,
+  "model": "/path/to/moe",
+  "topics": {
+    "code": {
+      "counts": {"0:3": 12, "0:5": 8, "1:2": 4},
+      "probe_prompts": 2
+    }
+  }
+}
+```
+
+### Serve with affinity
+
+```bash
+vllm serve <moe> --offload-backend hierarchical \
+  --tier-atlas-path /nvme/expert_store/.vllm_expert_atlas.json \
+  --tier-affinity-topic code \
+  --tier-num-slots 4 --tier-ram-gb 8 --enforce-eager
+```
+
+Unset `--tier-atlas-path` (default) → pure LFRU / usage pins. Missing atlas
+file or unknown topic falls back the same way.
+
+Eval: held-out prompts for a topic with affinity on vs cold usage — compare
+`device_hit_rate` / `ram_hit_rate` and `tok_s_warm` via
+`benchmarks/hierarchical_tier_bakeoff.py` (`--tier-atlas-path` /
+`--tier-affinity-topic`).
 
 ## Metrics
 

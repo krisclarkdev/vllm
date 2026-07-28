@@ -538,6 +538,8 @@ class EngineArgs:
     tier_io_workers: int = HierarchicalOffloadConfig.tier_io_workers
     tier_direct: bool = HierarchicalOffloadConfig.tier_direct
     tier_usage_path: str | None = HierarchicalOffloadConfig.tier_usage_path
+    tier_atlas_path: str | None = HierarchicalOffloadConfig.tier_atlas_path
+    tier_affinity_topic: str | None = HierarchicalOffloadConfig.tier_affinity_topic
     tier_dense_prefetch: bool = HierarchicalOffloadConfig.tier_dense_prefetch
     tier_num_slots: int = HierarchicalOffloadConfig.tier_num_slots
     tier_allow_cuda_graphs: bool = HierarchicalOffloadConfig.tier_allow_cuda_graphs
@@ -1294,6 +1296,12 @@ class EngineArgs:
         offload_group.add_argument("--tier-direct", **hier_kwargs["tier_direct"])
         offload_group.add_argument(
             "--tier-usage-path", **hier_kwargs["tier_usage_path"]
+        )
+        offload_group.add_argument(
+            "--tier-atlas-path", **hier_kwargs["tier_atlas_path"]
+        )
+        offload_group.add_argument(
+            "--tier-affinity-topic", **hier_kwargs["tier_affinity_topic"]
         )
         offload_group.add_argument(
             "--tier-dense-prefetch", **hier_kwargs["tier_dense_prefetch"]
@@ -2465,6 +2473,8 @@ class EngineArgs:
                 tier_io_workers=self.tier_io_workers,
                 tier_direct=self.tier_direct,
                 tier_usage_path=self.tier_usage_path,
+                tier_atlas_path=self.tier_atlas_path,
+                tier_affinity_topic=self.tier_affinity_topic,
                 tier_dense_prefetch=self.tier_dense_prefetch,
                 tier_num_slots=self.tier_num_slots,
                 tier_allow_cuda_graphs=self.tier_allow_cuda_graphs,

@@ -417,6 +417,77 @@ def test_tier_spec_pin_default_on():
     assert cfg.tier_spec_pin is True
 
 
+def test_expert_atlas_roundtrip(tmp_path):
+    from vllm.model_executor.offloader.hierarchical.atlas import ExpertAtlas
+
+    atlas = ExpertAtlas()
+    atlas.model = "toy-moe"
+    atlas.merge_counts(
+        "code",
+        {"0:1": 5, "0:3": 9, "1:2": 2},
+        probe_prompts=2,
+    )
+    atlas.merge_counts("math", {"0:0": 7, "0:1": 1}, probe_prompts=1)
+    path = tmp_path / ".vllm_expert_atlas.json"
+    atlas.save(path)
+    loaded = ExpertAtlas(path)
+    assert loaded.topics == ["code", "math"]
+    assert loaded.hottest("code", 0, 2, 8) == [3, 1]
+    assert loaded.model == "toy-moe"
+    # Affinity prefers code expert 3 over usage-only 0 when atlas weight is high.
+    hot = loaded.affinity_hottest(
+        "code",
+        0,
+        2,
+        8,
+        usage_counts={(0, 0): 100},
+        atlas_weight=20.0,
+    )
+    assert hot[0] == 3
+
+
+def test_expert_atlas_affinity_fallback_without_topic():
+    from vllm.model_executor.offloader.hierarchical.atlas import ExpertAtlas
+
+    atlas = ExpertAtlas()
+    atlas.merge_counts("code", {"0:2": 4})
+    assert atlas.hottest("missing", 0, 4, 8) == []
+    assert atlas.affinity_hottest("missing", 0, 4, 8) == []
+
+
+def test_tier_atlas_defaults_off():
+    cfg = HierarchicalOffloadConfig()
+    assert cfg.tier_atlas_path is None
+    assert cfg.tier_affinity_topic is None
+
+
+def test_seed_hot_experts_uses_atlas(monkeypatch, tmp_path):
+    from vllm.model_executor.offloader.hierarchical import manager as mgr_mod
+    from vllm.model_executor.offloader.hierarchical.atlas import ExpertAtlas
+    from vllm.model_executor.offloader.hierarchical.manager import ExpertTierManager
+    from vllm.model_executor.offloader.hierarchical.usage import ExpertUsageStore
+
+    monkeypatch.setattr(mgr_mod.current_platform, "Stream", lambda: object())
+    atlas_path = tmp_path / "atlas.json"
+    atlas = ExpertAtlas()
+    atlas.merge_counts("code", {"0:5": 20, "0:1": 1})
+    atlas.save(atlas_path)
+
+    cfg = HierarchicalOffloadConfig(
+        tier_num_slots=2,
+        tier_ram_gb=0.01,
+        tier_atlas_path=str(atlas_path),
+        tier_affinity_topic="code",
+    )
+    mgr = ExpertTierManager(cfg)
+    mgr._usage = ExpertUsageStore(None)
+    mgr._usage._counts[(0, 0)] = 50  # cold usage prefers 0
+    mgr._atlas = ExpertAtlas(atlas_path)
+    mgr._affinity_topic = "code"
+    hot = mgr._seed_hot_experts(0, 2, 8)
+    assert hot[0] == 5
+
+
 def test_hierarchical_offloader_registers_modules():
     cfg = HierarchicalOffloadConfig(tier_num_slots=2, tier_ram_gb=0.01)
     off = HierarchicalOffloader(cfg)

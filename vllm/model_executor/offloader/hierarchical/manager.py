@@ -13,6 +13,9 @@ import torch.nn as nn
 
 from vllm.config.offload import HierarchicalOffloadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.offloader.hierarchical.atlas import (
+    load_atlas_or_none,
+)
 from vllm.model_executor.offloader.hierarchical.device_slots import ExpertSlotPool
 from vllm.model_executor.offloader.hierarchical.disk_store import (
     ExpertStoreReader,
@@ -138,6 +141,8 @@ class ExpertTierManager:
         self._ram: PinnedExpertRamCache | None = None
         self._disk: ExpertStoreReader | None = None
         self._usage: ExpertUsageStore | None = None
+        self._atlas = None  # ExpertAtlas | None; loaded in post_init
+        self._affinity_topic: str | None = None
         self._pilot: PilotPrefetcher | None = None
         self._tokens_since_repin = 0
         self._records_since_flush = 0
@@ -360,6 +365,28 @@ class ExpertTierManager:
         )
         self._usage = ExpertUsageStore(usage_path)
 
+        self._atlas = load_atlas_or_none(self.config.tier_atlas_path)
+        self._affinity_topic = self.config.tier_affinity_topic
+        if self._atlas is not None and self._affinity_topic:
+            if self._affinity_topic not in self._atlas.topics:
+                logger.warning(
+                    "tier_affinity_topic=%r not in atlas topics %s; "
+                    "falling back to usage/LFRU pins",
+                    self._affinity_topic,
+                    self._atlas.topics,
+                )
+                self._affinity_topic = None
+            else:
+                logger.info(
+                    "Expert atlas affinity pins enabled (topic=%s, path=%s)",
+                    self._affinity_topic,
+                    self.config.tier_atlas_path,
+                )
+        elif self.config.tier_affinity_topic and self._atlas is None:
+            logger.warning(
+                "tier_affinity_topic set without a loadable atlas; ignoring"
+            )
+
         self._disk = ensure_store_or_none(
             self.config.tier_disk_path,
             num_workers=self.config.tier_io_workers,
@@ -418,9 +445,11 @@ class ExpertTierManager:
                     disk_weights=self.config.tier_disk_weights,
                 )
 
-            # Seed RAM (pinned hot) from usage heat + initial fill.
+            # Seed RAM (pinned hot) from usage heat + optional atlas affinity.
             seed_n = host_weights[0].shape[0] if full_residency else slots * 4
-            hot = self._usage.hottest(layer_id, seed_n, host_weights[0].shape[0])
+            hot = self._seed_hot_experts(
+                layer_id, seed_n, host_weights[0].shape[0]
+            )
             for eid in hot:
                 if not self._ram.enabled:
                     break
@@ -794,10 +823,44 @@ class ExpertTierManager:
         if self._ram is None or self._usage is None:
             return
         for layer_id, state in self.layers.items():
-            hot = self._usage.hottest(
+            hot = self._seed_hot_experts(
                 layer_id, state.slot_pool.num_slots, state.num_experts
             )
             self._ram.repin_hottest(layer_id, hot, max_swaps=4)
+
+    def _seed_hot_experts(
+        self, layer_id: int, limit: int, num_experts: int
+    ) -> list[int]:
+        """Hottest experts for seed/repin: atlas affinity when configured."""
+        assert self._usage is not None
+        if self._atlas is not None and self._affinity_topic:
+            hot = self._atlas.affinity_hottest(
+                self._affinity_topic,
+                layer_id,
+                limit,
+                num_experts,
+                usage_counts=self._usage._counts,
+            )
+            if hot:
+                return hot
+        return self._usage.hottest(layer_id, limit, num_experts)
+
+    def set_affinity_topic(self, topic: str | None) -> None:
+        """Switch affinity topic at session start (explicit id; v1 no auto)."""
+        if topic is None:
+            self._affinity_topic = None
+            return
+        if self._atlas is None:
+            logger.warning("set_affinity_topic(%r) ignored: no atlas loaded", topic)
+            return
+        if topic not in self._atlas.topics:
+            logger.warning(
+                "set_affinity_topic(%r): unknown topic (have %s)",
+                topic,
+                self._atlas.topics,
+            )
+            return
+        self._affinity_topic = topic
 
     def shutdown(self) -> None:
         if self._usage is not None:

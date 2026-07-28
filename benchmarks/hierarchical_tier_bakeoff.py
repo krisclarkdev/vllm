@@ -52,6 +52,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tier-ram-gb", type=float, default=8.0)
     p.add_argument("--tier-disk-path", default=None)
     p.add_argument("--tier-pilot", action="store_true")
+    p.add_argument("--tier-atlas-path", default=None)
+    p.add_argument("--tier-affinity-topic", default=None)
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--num-prompts", type=int, default=4)
     p.add_argument(
@@ -176,6 +178,8 @@ def _run_bakeoff(args: argparse.Namespace) -> None:
                 "tier_ram_gb": args.tier_ram_gb,
                 "tier_disk_path": args.tier_disk_path,
                 "tier_pilot": args.tier_pilot,
+                "tier_atlas_path": args.tier_atlas_path,
+                "tier_affinity_topic": args.tier_affinity_topic,
             }
         )
 
@@ -247,6 +251,10 @@ def _run_bakeoff(args: argparse.Namespace) -> None:
             "tier_ram_gb": None if args.baseline else args.tier_ram_gb,
             "tier_disk_path": None if args.baseline else args.tier_disk_path,
             "tier_pilot": None if args.baseline else args.tier_pilot,
+            "tier_atlas_path": None if args.baseline else args.tier_atlas_path,
+            "tier_affinity_topic": (
+                None if args.baseline else args.tier_affinity_topic
+            ),
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_num_seqs": args.max_num_seqs,
