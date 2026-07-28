@@ -111,6 +111,11 @@ class HierarchicalOffloadConfig:
     ``numa_interleave_memory`` when available. Also honored via
     ``VLLM_TIER_NUMA=1``. No-op with a log if unsupported."""
 
+    tier_spec_pin: bool = True
+    """When speculative decoding is active, freeze live LFRU repin and keep a
+    step-wide expert protect set across draft + verify forwards (Colibri
+    SPEC_PIN). Set False only for debugging."""
+
     tier_policy: TierPolicy = "quality"
     """``quality``: no live repin. ``balanced``: LFRU repin of hot experts."""
 

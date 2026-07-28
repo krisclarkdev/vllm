@@ -177,6 +177,12 @@ class HierarchicalOffloader(BaseOffloader):
     def notify_tokens(self, n: int) -> None:
         self.manager.notify_tokens(n)
 
+    def begin_spec_step(self) -> None:
+        self.manager.begin_spec_step()
+
+    def end_spec_step(self) -> None:
+        self.manager.end_spec_step()
+
     def shutdown(self) -> None:
         self.manager.shutdown()
         set_tier_manager(None)

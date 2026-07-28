@@ -530,6 +530,7 @@ class EngineArgs:
     tier_disk_mirror: str | None = HierarchicalOffloadConfig.tier_disk_mirror
     tier_disk_weights: str | None = HierarchicalOffloadConfig.tier_disk_weights
     tier_numa: bool = HierarchicalOffloadConfig.tier_numa
+    tier_spec_pin: bool = HierarchicalOffloadConfig.tier_spec_pin
     tier_policy: str = HierarchicalOffloadConfig.tier_policy
     tier_repin_tokens: int = HierarchicalOffloadConfig.tier_repin_tokens
     tier_pilot: bool = HierarchicalOffloadConfig.tier_pilot
@@ -1276,6 +1277,9 @@ class EngineArgs:
             "--tier-disk-weights", **hier_kwargs["tier_disk_weights"]
         )
         offload_group.add_argument("--tier-numa", **hier_kwargs["tier_numa"])
+        offload_group.add_argument(
+            "--tier-spec-pin", **hier_kwargs["tier_spec_pin"]
+        )
         offload_group.add_argument("--tier-policy", **hier_kwargs["tier_policy"])
         offload_group.add_argument(
             "--tier-repin-tokens", **hier_kwargs["tier_repin_tokens"]
@@ -2453,6 +2457,7 @@ class EngineArgs:
                 tier_disk_mirror=self.tier_disk_mirror,
                 tier_disk_weights=self.tier_disk_weights,
                 tier_numa=self.tier_numa,
+                tier_spec_pin=self.tier_spec_pin,
                 tier_policy=self.tier_policy,  # type: ignore[arg-type]
                 tier_repin_tokens=self.tier_repin_tokens,
                 tier_pilot=self.tier_pilot,

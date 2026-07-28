@@ -88,6 +88,14 @@ class BaseOffloader(ABC):
         """Notify that ``n`` tokens were scheduled/emitted (learned pins)."""
         pass
 
+    def begin_spec_step(self) -> None:  # noqa: B027
+        """Enter a speculative verify+draft step (hierarchical SPEC_PIN)."""
+        pass
+
+    def end_spec_step(self) -> None:  # noqa: B027
+        """Leave a speculative verify+draft step."""
+        pass
+
     def shutdown(self) -> None:  # noqa: B027
         """Release offloader resources. Override in subclasses."""
         pass
