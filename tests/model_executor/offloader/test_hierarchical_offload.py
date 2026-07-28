@@ -623,7 +623,6 @@ def test_pilot_gate_registration_and_prefetch(monkeypatch):
             param_names=["w13_weight", "w2_weight"],
             slot_pool=pool,
             row_nbytes=row_nbytes,
-            full_residency=False,
         )
         # Force non-full-residency path off for simplicity.
         mgr.layers[lid].full_residency = False

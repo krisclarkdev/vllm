@@ -269,6 +269,7 @@ class ExpertStoreReader:
         """O_DIRECT pread via an aligned mmap window, then copy the payload."""
         aligned_off, aligned_len, pad_before = direct_read_window(offset, nbytes)
         mm = mmap.mmap(-1, aligned_len)
+        view: memoryview | None = None
         try:
             view = memoryview(mm)
             fd = os.open(str(path), os.O_RDONLY | O_DIRECT)
@@ -289,6 +290,8 @@ class ExpertStoreReader:
                 os.close(fd)
             return bytes(view[pad_before : pad_before + nbytes])
         finally:
+            if view is not None:
+                view.release()
             mm.close()
 
 
