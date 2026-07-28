@@ -197,4 +197,34 @@ Audit (Mixtral hierarchical + XPU MoE):
 Graph matrix: default eager; `--tier-allow-cuda-graphs` allows piecewise /
 attention experiments only — full MoE+remap capture is not claimed.
 
+## PR-F speculative decoding coexistence
+
+Unit coverage: `test_slot_pool_extra_protect_across_calls`,
+`test_spec_step_protects_verify_experts`, `test_spec_pin_skips_balanced_repin`
+in `tests/model_executor/offloader/test_hierarchical_offload.py`.
+
+### How to measure (hal / Ornith)
+
+Compare warm tok/s and acceptance with hierarchical fixed
+(`--tier-num-slots 4 --tier-policy balanced`) and speculation on vs off:
+
+```bash
+# Spec off (control)
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 4 --tier-ram-gb 8 --tier-policy balanced \
+  --warm 4 --max-tokens 64 --prompt Hi \
+  --output /tmp/hier_pr_f_nospec.json
+
+# Spec on (same hierarchical flags + speculative config as in serve)
+# Prefer an existing draft method the model supports; record acceptance from
+# engine metrics / logs. If warm tok_s_warm(spec) < tok_s_warm(no-spec),
+# disable speculation for that cold-cache / slots budget — acceptance alone
+# is not enough when H2D stalls dominate.
+```
+
+Acceptance for merge: unit tests green; no draft/verify expert desync under
+SPEC_PIN; PR body includes support matrix from
+`hierarchical_expert_offload.md` and any hardware smoke numbers available.
+
 AI assistance was used for this feature implementation.

@@ -4155,6 +4155,20 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _begin_hier_spec_step(self) -> None:
+        """Freeze hierarchical LFRU repin across verify+draft (SPEC_PIN)."""
+        self._hier_spec_step_open = False
+        if self.speculative_config is None:
+            return
+        get_offloader().begin_spec_step()
+        self._hier_spec_step_open = True
+
+    def _end_hier_spec_step(self) -> None:
+        if not getattr(self, "_hier_spec_step_open", False):
+            return
+        get_offloader().end_spec_step()
+        self._hier_spec_step_open = False
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4414,120 +4428,130 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        # Update the EPLB meta.
-        if self.eplb_state is not None:
-            self.eplb_state.prepare_forward(
-                self.model_config,
-                num_tokens_unpadded,
-                ubatch_slices_padded,
-            )
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-
-        # Learned hierarchical pins: advance heat / periodic usage flush.
-        get_offloader().notify_tokens(num_scheduled_tokens)
-
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
-
-            if not self.broadcast_pp_output:
-                # Common case.
-                if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
-                    assert isinstance(hidden_states, IntermediateTensors)
-                    self.kv_connector_output = kv_connector_output
-                    return hidden_states
-
-                if self.is_pooling_model:
-                    # Return the pooling output.
-                    return self._pool(
-                        hidden_states,
-                        num_scheduled_tokens,
-                        num_scheduled_tokens_np,
-                        kv_connector_output,
-                    )
-
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
-            else:
-                # Rare case.
-                assert not self.is_pooling_model
-
-                sample_hidden_states = hidden_states[logits_indices]
-                if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(
-                            self.vllm_config, num_tokens_padded
-                        )
-                    }
-                    get_pp_group().send_tensor_dict(
-                        hidden_states.tensors,
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
-                    )
-                    logits = None
-                else:
-                    logits = self.model.compute_logits(sample_hidden_states)
-
-                model_output_broadcast_data: dict[str, Any] = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
-
-                broadcasted = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+        # Shared ExpertTierManager across verify + draft: protect expert union
+        # and freeze balanced LFRU repin until draft finishes (SPEC_PIN).
+        self._begin_hier_spec_step()
+        hier_hand_off_to_sample = False
+        try:
+            # Update the EPLB meta.
+            if self.eplb_state is not None:
+                self.eplb_state.prepare_forward(
+                    self.model_config,
+                    num_tokens_unpadded,
+                    ubatch_slices_padded,
                 )
-                assert broadcasted is not None
-                logits = broadcasted["logits"]
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
-        self.execute_model_state = ExecuteModelState(
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            ec_connector_output,
-            cudagraph_stats,
-            slot_mappings,
-        )
-        self.kv_connector_output = kv_connector_output
+            # Learned hierarchical pins: advance heat / periodic usage flush.
+            get_offloader().notify_tokens(num_scheduled_tokens)
 
-        # Now the batch has been launched we can wait for corrections from the
-        # previous model forward without breaking async scheduling.
-        if deferred_state_corrections_fn:
-            deferred_state_corrections_fn()
+            with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+                if self.use_aux_hidden_state_outputs:
+                    # True when EAGLE 3 is used.
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    # Common case.
+                    hidden_states = model_output
+                    aux_hidden_states = None
 
-        return None
+                if not self.broadcast_pp_output:
+                    # Common case.
+                    if not get_pp_group().is_last_rank:
+                        # Return the intermediate tensors.
+                        assert isinstance(hidden_states, IntermediateTensors)
+                        self.kv_connector_output = kv_connector_output
+                        return hidden_states
+
+                    if self.is_pooling_model:
+                        # Return the pooling output.
+                        return self._pool(
+                            hidden_states,
+                            num_scheduled_tokens,
+                            num_scheduled_tokens_np,
+                            kv_connector_output,
+                        )
+
+                    sample_hidden_states = hidden_states[logits_indices]
+                    logits = self.model.compute_logits(sample_hidden_states)
+                else:
+                    # Rare case.
+                    assert not self.is_pooling_model
+
+                    sample_hidden_states = hidden_states[logits_indices]
+                    if not get_pp_group().is_last_rank:
+                        all_gather_tensors = {
+                            "residual": not is_residual_scattered_for_sp(
+                                self.vllm_config, num_tokens_padded
+                            )
+                        }
+                        get_pp_group().send_tensor_dict(
+                            hidden_states.tensors,
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
+                        logits = None
+                    else:
+                        logits = self.model.compute_logits(sample_hidden_states)
+
+                    model_output_broadcast_data: dict[str, Any] = {}
+                    if logits is not None:
+                        model_output_broadcast_data["logits"] = logits.contiguous()
+
+                    broadcasted = get_pp_group().broadcast_tensor_dict(
+                        model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                    )
+                    assert broadcasted is not None
+                    logits = broadcasted["logits"]
+
+            self.execute_model_state = ExecuteModelState(
+                scheduler_output,
+                logits,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
+                ec_connector_output,
+                cudagraph_stats,
+                slot_mappings,
+            )
+            self.kv_connector_output = kv_connector_output
+
+            # Now the batch has been launched we can wait for corrections from the
+            # previous model forward without breaking async scheduling.
+            if deferred_state_corrections_fn:
+                deferred_state_corrections_fn()
+
+            # sample_tokens() closes the SPEC_PIN window after draft.
+            hier_hand_off_to_sample = True
+            return None
+        finally:
+            if not hier_hand_off_to_sample:
+                self._end_hier_spec_step()
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
@@ -4574,6 +4598,37 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        try:
+            return self._sample_tokens_impl(
+                grammar_output,
+                scheduler_output,
+                logits,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
+                ec_connector_output,
+                cudagraph_stats,
+                slot_mappings,
+            )
+        finally:
+            self._end_hier_spec_step()
+
+    def _sample_tokens_impl(
+        self,
+        grammar_output: "GrammarOutput | None",
+        scheduler_output,
+        logits,
+        spec_decode_metadata,
+        spec_decode_common_attn_metadata,
+        hidden_states,
+        sample_hidden_states,
+        aux_hidden_states,
+        ec_connector_output,
+        cudagraph_stats,
+        slot_mappings,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(

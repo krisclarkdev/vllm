@@ -55,6 +55,7 @@ vllm serve <moe-model> \
 | `--tier-disk-mirror` | Optional second NVMe ExpertStore root (read-only) |
 | `--tier-disk-weights a,b` | Primary/mirror bandwidth weights (or auto-probe) |
 | `--tier-numa` | Interleave pinned RAM via libnuma (also `VLLM_TIER_NUMA`) |
+| `--tier-spec-pin` / `--no-tier-spec-pin` | Freeze LFRU repin + protect draft/verify expert union during a speculative step (default on) |
 | `--tier-policy quality\|balanced` | Live LFRU repin off/on |
 | `--tier-repin-tokens N` | Repin interval (balanced) |
 | `--tier-pilot` / `--tier-pilot-real` | Router-lookahead prefetch |
@@ -182,6 +183,41 @@ experiments).
 Requires platform graph enablement (e.g. `VLLM_XPU_ENABLE_XPU_GRAPH=1` on
 XPU). Graph boundaries still drain the copy stream via
 `sync_prev_onload` / `join_after_forward`.
+
+## Speculative decoding coexistence (SPEC_PIN)
+
+Draft and target forwards share **one** `ExpertTierManager` singleton on the
+worker (`get_tier_manager()`). There is no separate draft tier manager; MoE
+layers that share a `layer_id` also share the same slot pool.
+
+During a speculative step (`execute_model` verify → `sample_tokens` draft):
+
+1. `begin_spec_step` / `end_spec_step` bracket the step.
+2. Slot eviction protects the **union** of local expert ids ensured so far in
+   the step (verify residents cannot be draft-evicted).
+3. With `--tier-policy balanced` and `--tier-spec-pin` (default),
+   `notify_tokens` still records usage but **does not** live LFRU
+   `repin_hottest` mid-step — pins must not diverge between verify and draft.
+
+### Support matrix
+
+| Spec method | Hierarchical | Notes |
+|-------------|--------------|-------|
+| ngram / suffix / medusa heads | OK | No draft MoE; SPEC_PIN still freezes repin harmlessly |
+| EAGLE / EAGLE3 | Supported | Shared manager; draft MoE uses same pools when layer ids match |
+| Draft-model MoE | Supported | Same singleton; protect union across verify+draft ensures |
+| MTP (Gemma4 / Step3.5 / etc.) | Supported with caveats | Prefer matching draft/target expert quant; see warnings below |
+| DFlash | Supported | Same SPEC_PIN window |
+
+**Known-bad combinations (document / measure; no hard abort unless vLLM already
+checks):**
+
+- Draft MoE int8 / mismatched quant vs target when experts are remapped through
+  the same slot pack (weights must compute the same function).
+- Cold ExpertStore + speculation: acceptance rate may look fine while tok/s
+  drops — disable speculation when warm tok/s with spec < without (see eval doc).
+
+Disable SPEC_PIN only for debugging: `--no-tier-spec-pin`.
 
 ## Metrics
 

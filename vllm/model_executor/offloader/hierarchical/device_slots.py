@@ -122,15 +122,20 @@ class ExpertSlotPool:
         self,
         expert_ids: list[int],
         host_rows: dict[int, list[torch.Tensor]],
+        *,
+        extra_protect: set[int] | None = None,
     ) -> tuple[dict[int, int], list[torch.Event]]:
         """Ensure experts are resident; return remap and events to wait on.
 
-        Experts in ``expert_ids`` are protected from eviction by other
-        allocations in this same call (batch-union safety).
+        Experts in ``expert_ids`` (plus ``extra_protect``) are protected from
+        eviction by other allocations in this same call (batch-union / spec
+        step-union safety).
         """
         remap: dict[int, int] = {}
         events: list[torch.Event] = []
         protect = {e for e in expert_ids if e >= 0}
+        if extra_protect:
+            protect |= {e for e in extra_protect if e >= 0}
 
         for eid in expert_ids:
             if eid < 0:

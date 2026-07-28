@@ -148,6 +148,10 @@ class ExpertTierManager:
         self._pending_gates: list[tuple[int, nn.Module]] = []
         self._disk_fallback_seen = 0
         self._logged_host_id_sync = False
+        # Speculative decode (verify + draft): nestable step depth and the
+        # union of local expert ids touched so far this step (per layer).
+        self._spec_depth = 0
+        self._spec_protect: dict[int, set[int]] = {}
         # MoE expert modules still holding full packs on device during
         # construct/load. Oldest are spilled to host only under VRAM pressure
         # so we use GPU+RAM together instead of host-only (which causes swap).
@@ -155,6 +159,40 @@ class ExpertTierManager:
         # OS-pinned host bytes used while parking during load (capped later).
         self._pinned_host_bytes = 0
         self._pinned_host_budget = resolve_ram_budget_bytes(config)
+
+    def begin_spec_step(self) -> None:
+        """Enter a verify+draft speculative step (shared ExpertTierManager).
+
+        Nestable. While depth > 0 and ``tier_spec_pin``, live LFRU repin is
+        frozen and slot eviction protects the union of experts ensured so far
+        in this step (draft must not evict verify-needed experts).
+        """
+        self._spec_depth += 1
+        if self._spec_depth == 1:
+            self._spec_protect.clear()
+
+    def end_spec_step(self) -> None:
+        """Leave a speculative step; clear protect set at depth 0."""
+        if self._spec_depth <= 0:
+            return
+        self._spec_depth -= 1
+        if self._spec_depth == 0:
+            self._spec_protect.clear()
+
+    @property
+    def in_spec_step(self) -> bool:
+        return self._spec_depth > 0
+
+    def _note_spec_experts(self, layer_id: int, expert_ids: list[int]) -> None:
+        if self._spec_depth <= 0:
+            return
+        bucket = self._spec_protect.setdefault(layer_id, set())
+        bucket.update(e for e in expert_ids if e >= 0)
+
+    def _spec_extra_protect(self, layer_id: int) -> set[int] | None:
+        if self._spec_depth <= 0:
+            return None
+        return self._spec_protect.get(layer_id)
 
     def register_moe_module(self, layer_id: int, module: nn.Module) -> None:
         """Queue a RoutedExperts (or parent) module for post_init staging."""
@@ -744,6 +782,9 @@ class ExpertTierManager:
                 self._records_since_flush = 0
         if self.config.tier_policy != "balanced":
             return
+        # SPEC_PIN: do not live-repin between verify and draft in a step.
+        if self._spec_depth > 0 and self.config.tier_spec_pin:
+            return
         if self.config.tier_repin_tokens <= 0:
             return
         self._tokens_since_repin += n
@@ -827,6 +868,14 @@ class ExpertTierManager:
         state = self.layers[layer_id]
         pool = state.slot_pool
         unique_pos = [e for e in set(expert_ids) if e >= 0]
+        # Snapshot step-union protect *before* noting this call's experts so
+        # prior verify (or draft) residents stay non-evictable.
+        extra_protect = (
+            set(self._spec_extra_protect(layer_id) or ())
+            if self._spec_depth > 0
+            else None
+        )
+        self._note_spec_experts(layer_id, unique_pos)
         self.stats.ensure_calls += 1
         increment_prom(ensure_call=True)
         n_unique = len(unique_pos)
@@ -934,7 +983,9 @@ class ExpertTierManager:
             if disk_wait:
                 increment_prom(disk_wait_ns=disk_wait)
 
-        remap, events = pool.ensure_from_host_rows(expert_ids, host_rows)
+        remap, events = pool.ensure_from_host_rows(
+            expert_ids, host_rows, extra_protect=extra_protect
+        )
         return remap, events, needed
 
     def _unpack_host_row(

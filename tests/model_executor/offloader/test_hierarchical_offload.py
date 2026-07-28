@@ -266,6 +266,157 @@ def test_slot_pool_protects_same_batch_residents():
         pool.ensure_from_host_rows([0, 2, 3], host_rows)
 
 
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="Requires CUDA or XPU for device slot DMA",
+)
+def test_slot_pool_extra_protect_across_calls():
+    """extra_protect keeps prior-step experts non-evictable (SPEC_PIN union)."""
+    device = torch.device(f"{current_platform.device_type}:0")
+    E, H, I = 8, 8, 8
+    host_w13 = torch.randn(E, 2 * I, H)
+    host_w2 = torch.randn(E, H, I)
+    stream = current_platform.Stream()
+    pool = ExpertSlotPool(
+        layer_id=0,
+        weight_templates=[host_w13, host_w2],
+        num_slots=2,
+        copy_stream=stream,
+        device=device,
+    )
+    host_rows = {e: [host_w13[e], host_w2[e]] for e in range(E)}
+    compute = current_platform.current_stream()
+
+    remap, events = pool.ensure_from_host_rows([0, 1], host_rows)
+    for ev in events:
+        compute.wait_event(ev)
+    assert pool.contains(0) and pool.contains(1)
+
+    # Draft needs expert 2 but must not evict verify's expert 0.
+    remap2, events2 = pool.ensure_from_host_rows(
+        [2], host_rows, extra_protect={0}
+    )
+    for ev in events2:
+        compute.wait_event(ev)
+    assert pool.contains(0) and pool.contains(2)
+    assert not pool.contains(1)
+    assert set(remap2.keys()) == {2}
+
+
+def test_spec_step_protects_verify_experts(monkeypatch):
+    """begin_spec_step unions protect across schedule_ensure calls."""
+    from vllm.model_executor.offloader.hierarchical import manager as mgr_mod
+    from vllm.model_executor.offloader.hierarchical.manager import ExpertTierManager
+
+    monkeypatch.setattr(mgr_mod.current_platform, "Stream", lambda: object())
+
+    cfg = HierarchicalOffloadConfig(tier_num_slots=2, tier_ram_gb=0.01)
+    mgr = ExpertTierManager(cfg)
+
+    class _FakePool:
+        def __init__(self):
+            self.calls: list[tuple[list[int], set[int] | None]] = []
+            self._resident: set[int] = set()
+            self.num_slots = 2
+
+        def contains(self, eid: int) -> bool:
+            return eid in self._resident
+
+        def ensure_from_host_rows(self, expert_ids, host_rows, *, extra_protect=None):
+            self.calls.append((list(expert_ids), set(extra_protect or ())))
+            for eid in expert_ids:
+                if eid >= 0:
+                    self._resident.add(int(eid))
+            return {int(e): i for i, e in enumerate(expert_ids) if e >= 0}, []
+
+        def mark_ready(self, _ids):
+            return None
+
+        def slot_of(self, eid: int):
+            return 0 if eid in self._resident else None
+
+    class _FakeState:
+        def __init__(self, pool):
+            self.slot_pool = pool
+            self.row_nbytes = 8
+            self.num_experts = 8
+            self.full_residency = False
+            self.host_weights = [
+                torch.zeros(8, 4),
+                torch.zeros(8, 4),
+            ]
+
+        def to_local(self, gid: int) -> int:
+            return gid
+
+    pool = _FakePool()
+    mgr.layers[0] = _FakeState(pool)  # type: ignore[assignment]
+    mgr._ram = None
+    mgr._disk = None
+
+    mgr.begin_spec_step()
+    # Verify ensures 0,1
+    mgr._schedule_ensure_layer(
+        0, [0, 1], record_usage=False
+    )
+    assert pool.calls[0][1] == set()  # first call: no prior protect
+    # Draft ensures 2 — prior union {0,1} must be passed as extra_protect
+    mgr._schedule_ensure_layer(0, [2], record_usage=False)
+    assert {0, 1}.issubset(pool.calls[1][1])
+    mgr.end_spec_step()
+    assert not mgr.in_spec_step
+
+
+def test_spec_pin_skips_balanced_repin(monkeypatch):
+    """During a SPEC_PIN step, balanced notify_tokens must not repin."""
+    from vllm.model_executor.offloader.hierarchical import manager as mgr_mod
+    from vllm.model_executor.offloader.hierarchical.manager import ExpertTierManager
+
+    monkeypatch.setattr(mgr_mod.current_platform, "Stream", lambda: object())
+
+    cfg = HierarchicalOffloadConfig(
+        tier_num_slots=2,
+        tier_ram_gb=0.01,
+        tier_policy="balanced",
+        tier_repin_tokens=1,
+        tier_spec_pin=True,
+    )
+    mgr = ExpertTierManager(cfg)
+    called = {"n": 0}
+
+    class _FakeRam:
+        enabled = True
+
+        def repin_hottest(self, *args, **kwargs):
+            called["n"] += 1
+
+    mgr._ram = _FakeRam()  # type: ignore[assignment]
+    mgr._usage = type(
+        "U",
+        (),
+        {"hottest": staticmethod(lambda *a, **k: [0]), "flush": lambda self: None},
+    )()
+
+    class _FakeState:
+        def __init__(self):
+            self.slot_pool = type("P", (), {"num_slots": 2})()
+            self.num_experts = 8
+
+    mgr.layers[0] = _FakeState()  # type: ignore[assignment]
+
+    mgr.begin_spec_step()
+    mgr.notify_tokens(10)
+    assert called["n"] == 0
+    mgr.end_spec_step()
+    mgr.notify_tokens(10)
+    assert called["n"] == 1
+
+
+def test_tier_spec_pin_default_on():
+    cfg = HierarchicalOffloadConfig()
+    assert cfg.tier_spec_pin is True
+
+
 def test_hierarchical_offloader_registers_modules():
     cfg = HierarchicalOffloadConfig(tier_num_slots=2, tier_ram_gb=0.01)
     off = HierarchicalOffloader(cfg)
