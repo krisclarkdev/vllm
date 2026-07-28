@@ -292,6 +292,20 @@ class MoERunner(MoERunnerInterface):
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
 
+        # Hierarchical expert staging: register RoutedExperts + gate with tier.
+        try:
+            from vllm.model_executor.offloader.hierarchical.hooks import (
+                register_moe_gate,
+                register_routed_experts,
+            )
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            lid = extract_layer_index(layer_name)
+            register_routed_experts(lid, routed_experts)
+            register_moe_gate(lid, gate)
+        except Exception:
+            pass
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
@@ -575,6 +589,19 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
+            )
+
+            # Hierarchical: schedule H2D, wait before GEMM, PILOT overlaps GEMM.
+            from vllm.model_executor.offloader.hierarchical.hooks import (
+                maybe_pilot_after_ensure,
+                maybe_schedule_ensure,
+                maybe_wait_ensure,
+            )
+
+            pending = maybe_schedule_ensure(self.layer_id, topk_ids)
+            topk_ids = maybe_wait_ensure(pending, topk_ids)
+            maybe_pilot_after_ensure(
+                self.layer_id, hidden_states, pending=pending
             )
 
             fused_out = self.routed_experts.forward_modular(

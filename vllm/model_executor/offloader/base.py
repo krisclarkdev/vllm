@@ -84,6 +84,22 @@ class BaseOffloader(ABC):
         """Join streams after forward. Override in subclasses."""
         pass
 
+    def notify_tokens(self, n: int) -> None:  # noqa: B027
+        """Notify that ``n`` tokens were scheduled/emitted (learned pins)."""
+        pass
+
+    def begin_spec_step(self) -> None:  # noqa: B027
+        """Enter a speculative verify+draft step (hierarchical SPEC_PIN)."""
+        pass
+
+    def end_spec_step(self) -> None:  # noqa: B027
+        """Leave a speculative verify+draft step."""
+        pass
+
+    def shutdown(self) -> None:  # noqa: B027
+        """Release offloader resources. Override in subclasses."""
+        pass
+
     def _wait_for_layer(self, layer_idx: int) -> None:  # noqa: B027
         """Wait for layer prefetch. Override in subclasses."""
         pass
@@ -127,8 +143,8 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     """Create an offloader based on the offload configuration.
 
     Uses the explicit ``offload_backend`` selector.  When set to ``"auto"``,
-    selects prefetch if ``offload_group_size > 0``, UVA if
-    ``cpu_offload_gb > 0``, otherwise noop.
+    selects hierarchical if active, else prefetch if ``offload_group_size > 0``,
+    UVA if ``cpu_offload_gb > 0``, otherwise noop.
     """
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
@@ -136,15 +152,24 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     backend = offload_config.offload_backend
     uva = offload_config.uva
     prefetch = offload_config.prefetch
+    hierarchical = offload_config.hierarchical
 
     if backend == "auto":
-        if prefetch.offload_group_size > 0:
+        if hierarchical.is_active():
+            backend = "hierarchical"
+        elif prefetch.offload_group_size > 0:
             backend = "prefetch"
         elif uva.cpu_offload_gb > 0:
             backend = "uva"
         else:
             return NoopOffloader()
 
+    if backend == "hierarchical":
+        from vllm.model_executor.offloader.hierarchical_offloader import (
+            HierarchicalOffloader,
+        )
+
+        return HierarchicalOffloader(hierarchical)
     if backend == "prefetch":
         return PrefetchOffloader(
             group_size=prefetch.offload_group_size,
