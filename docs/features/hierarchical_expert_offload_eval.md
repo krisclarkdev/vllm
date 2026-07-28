@@ -136,4 +136,31 @@ Full-residency tok/s parity is **not** claimed on this GPU/model. Treat
 with vs without async+pilot). Revisit slots=`E` on a smaller model, lower
 profile util, or after memory wins.
 
+## PR-C async / PILOT / O_DIRECT (hal)
+
+```bash
+# Control (PR-B path): slots=4, no pilot
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 4 --tier-ram-gb 8 --warm 8 --max-tokens 64 \
+  --prompt Hi --max-num-batched-tokens 1 --max-num-seqs 1 \
+  --output /tmp/hier_pr_c_nopilot.json
+
+# Treatment: schedule/wait + PILOT
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 4 --tier-ram-gb 8 --tier-pilot --warm 8 --max-tokens 64 \
+  --prompt Hi --max-num-batched-tokens 1 --max-num-seqs 1 \
+  --output /tmp/hier_pr_c_pilot.json
+```
+
+Acceptance: warm decode shows lower `h2d_stall_ns` and/or higher
+`device_hit_rate` vs the no-pilot control (same slots). Fill results after
+hal run.
+
+| Setup | tok_s_warm | h2d_stall_ms | device hit rate | Notes |
+|-------|------------|--------------|-----------------|-------|
+| slots=4 no pilot | | | | `/tmp/hier_pr_c_nopilot.json` |
+| slots=4 + pilot | | | | `/tmp/hier_pr_c_pilot.json` |
+
 AI assistance was used for this feature implementation.

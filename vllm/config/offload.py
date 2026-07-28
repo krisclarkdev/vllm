@@ -109,13 +109,16 @@ class HierarchicalOffloadConfig:
     """Enable router-lookahead prefetch of the next MoE layer's experts."""
 
     tier_pilot_real: bool = False
-    """Move pilot prefetch off the critical path (deeper async pipeline)."""
+    """Stronger PILOT: run the next layer's gate on the current hidden state
+    (extra gate forward cost) instead of reusing the current topk as a hint."""
 
     tier_io_workers: int = Field(default=8, ge=1)
     """Disk→RAM worker pool size."""
 
     tier_direct: bool = True
-    """Prefer O_DIRECT for ExpertStore reads when the filesystem supports it."""
+    """Prefer O_DIRECT for ExpertStore reads when the filesystem supports it.
+    Failed DIRECT reads increment ``disk_direct_fallback`` and use buffered I/O.
+    """
 
     tier_usage_path: str | None = None
     """Path for the learned expert-usage heat map. Defaults to

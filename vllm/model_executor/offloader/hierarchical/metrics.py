@@ -23,6 +23,9 @@ class TierStats:
     disk_wait_ns: int = 0
     unique_experts_sum: int = 0
     ensure_calls: int = 0
+    disk_direct_fallback: int = 0
+    pilot_predict_hits: int = 0
+    pilot_predict_misses: int = 0
     # Optional coarse histogram: unique-expert count → occurrences.
     unique_experts_hist: dict[int, int] = field(default_factory=dict)
 
@@ -30,6 +33,7 @@ class TierStats:
         device_lookups = self.device_hits + self.device_misses
         ram_lookups = self.ram_hits + self.ram_misses
         disk_lookups = self.disk_hits + self.disk_misses
+        pilot_lookups = self.pilot_predict_hits + self.pilot_predict_misses
         return {
             "device_hits": self.device_hits,
             "device_misses": self.device_misses,
@@ -48,6 +52,11 @@ class TierStats:
                 str(k): v for k, v in sorted(self.unique_experts_hist.items())
             },
             "ensure_calls": self.ensure_calls,
+            "disk_direct_fallback": self.disk_direct_fallback,
+            "pilot_predict_hits": self.pilot_predict_hits,
+            "pilot_predict_misses": self.pilot_predict_misses,
+            "pilot_predict_hit_rate": self.pilot_predict_hits
+            / max(1, pilot_lookups),
             "device_hit_rate": self.device_hits / max(1, device_lookups),
             "ram_hit_rate": self.ram_hits / max(1, ram_lookups),
             "disk_hit_rate": self.disk_hits / max(1, disk_lookups),
@@ -103,6 +112,18 @@ def _ensure_prometheus() -> None:
             "vllm_tier_expert_ensure_calls_total",
             "Calls to hierarchical ensure_layer",
         )
+        _prom_counters["disk_direct_fallback"] = Counter(
+            "vllm_tier_expert_disk_direct_fallback_total",
+            "ExpertStore O_DIRECT reads that fell back to buffered I/O",
+        )
+        _prom_counters["pilot_predict_hits"] = Counter(
+            "vllm_tier_expert_pilot_predict_hits_total",
+            "PILOT predictions that matched the next layer's real topk",
+        )
+        _prom_counters["pilot_predict_misses"] = Counter(
+            "vllm_tier_expert_pilot_predict_misses_total",
+            "PILOT predictions that missed the next layer's real topk",
+        )
         _prom_counters["hit_rate"] = Gauge(
             "vllm_tier_expert_device_hit_rate",
             "Device-tier hit rate for hierarchical expert staging",
@@ -133,6 +154,8 @@ def increment_prom(
     disk_bytes: int = 0,
     disk_wait_ns: int = 0,
     ensure_call: bool = False,
+    disk_direct_fallback: int = 0,
+    pilot_hit: bool | None = None,
 ) -> None:
     """Increment prometheus counters for a staging event."""
     _ensure_prometheus()
@@ -169,3 +192,17 @@ def increment_prom(
             c.inc()  # type: ignore[attr-defined]
         except Exception:
             pass
+    if disk_direct_fallback and (
+        c := _prom_counters.get("disk_direct_fallback")
+    ) is not None:
+        try:
+            c.inc(disk_direct_fallback)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if pilot_hit is not None:
+        key = "pilot_predict_hits" if pilot_hit else "pilot_predict_misses"
+        if (c := _prom_counters.get(key)) is not None:
+            try:
+                c.inc()  # type: ignore[attr-defined]
+            except Exception:
+                pass
