@@ -216,3 +216,130 @@ def test_hierarchical_offloader_registers_modules():
     assert len(wrapped) == 2
     assert len(off.manager._pending_modules) >= 2
     off.shutdown()
+
+
+def test_tier_stats_snapshot_and_reset():
+    from vllm.model_executor.offloader.hierarchical.metrics import TierStats
+
+    stats = TierStats()
+    stats.device_hits = 3
+    stats.device_misses = 1
+    stats.ensure_calls = 2
+    stats.h2d_bytes = 100
+    stats.unique_experts_sum = 5
+    stats.unique_experts_hist[2] = 1
+    snap = stats.snapshot()
+    assert snap["device_hits"] == 3
+    assert snap["device_misses"] == 1
+    assert snap["ensure_calls"] == 2
+    assert snap["h2d_bytes"] == 100
+    assert snap["unique_experts_sum"] == 5
+    assert snap["device_hit_rate"] == 0.75
+    assert snap["unique_experts_hist"]["2"] == 1
+    stats.reset()
+    assert stats.device_hits == 0
+    assert stats.ensure_calls == 0
+    assert stats.unique_experts_hist == {}
+
+
+def test_tier_stats_move_on_fake_ensure(monkeypatch):
+    """Counters must move on a CPU/mock ensure path (no real DMA)."""
+    from unittest.mock import MagicMock
+
+    from vllm.model_executor.offloader.hierarchical.manager import (
+        ExpertTierManager,
+        LayerTierState,
+    )
+
+    class _FakeStream:
+        def wait_event(self, _ev):
+            return None
+
+    monkeypatch.setattr(
+        "vllm.model_executor.offloader.hierarchical.manager.current_platform.current_stream",
+        lambda: _FakeStream(),
+    )
+
+    cfg = HierarchicalOffloadConfig(tier_num_slots=2, tier_ram_gb=0.01)
+    mgr = ExpertTierManager(cfg)
+
+    E, H, I = 4, 8, 16
+    host_w13 = torch.randn(E, 2 * I, H)
+    host_w2 = torch.randn(E, H, I)
+    host_weights = [host_w13, host_w2]
+    row_nbytes = int(host_w13[0].nbytes + host_w2[0].nbytes)
+
+    resident: set[int] = set()
+    pool = MagicMock()
+    pool.num_slots = 2
+
+    def contains(eid: int) -> bool:
+        return eid in resident
+
+    def ensure_from_host_rows(ids, host_rows):
+        remap: dict[int, int] = {}
+        for eid in ids:
+            if eid < 0:
+                continue
+            assert eid in host_rows
+            if eid not in resident:
+                resident.add(eid)
+                remap[eid] = len(resident) - 1
+        return remap, []
+
+    def slot_of(eid: int):
+        if eid not in resident:
+            return None
+        return sorted(resident).index(eid)
+
+    pool.contains.side_effect = contains
+    pool.ensure_from_host_rows.side_effect = ensure_from_host_rows
+    pool.slot_of.side_effect = slot_of
+    pool.mark_ready.side_effect = lambda _ids: None
+
+    mgr.layers[0] = LayerTierState(
+        layer_id=0,
+        module=_FakeExperts(num_experts=E, hidden=H, inter=I),
+        host_weights=host_weights,
+        param_names=["w13_weight", "w2_weight"],
+        slot_pool=pool,
+        row_nbytes=row_nbytes,
+    )
+    mgr._ram = PinnedExpertRamCache(
+        capacity_bytes=row_nbytes * 8, row_nbytes=row_nbytes
+    )
+
+    mgr._ensure_layer(0, [0, 1], record_usage=False)
+    snap1 = mgr.stats.snapshot()
+    assert snap1["ensure_calls"] == 1
+    assert snap1["device_misses"] == 2
+    assert snap1["device_hits"] == 0
+    assert snap1["ram_misses"] == 2  # host pack fallback
+    assert snap1["disk_hits"] == 0
+    assert snap1["disk_misses"] == 0
+    assert snap1["h2d_bytes"] == 2 * row_nbytes
+    assert snap1["unique_experts_sum"] == 2
+    assert snap1["ram_hits"] == 0
+
+    # Second ensure: device-resident + RAM-cached host rows.
+    mgr._ensure_layer(0, [0, 1], record_usage=False)
+    snap2 = mgr.stats.snapshot()
+    assert snap2["ensure_calls"] == 2
+    assert snap2["device_hits"] == 2
+    assert snap2["device_misses"] == 2
+    assert snap2["ram_hits"] == 2
+    assert snap2["unique_experts_sum"] == 4
+    assert snap2["h2d_bytes"] == 2 * row_nbytes  # no new DMA
+
+    # Disk miss path when a store is attached without this layer.
+    disk = MagicMock()
+    disk.has_layer.return_value = False
+    mgr._disk = disk
+    mgr.stats.reset()
+    resident.clear()
+    mgr._ensure_layer(0, [2], record_usage=False)
+    snap3 = mgr.stats.snapshot()
+    assert snap3["ensure_calls"] == 1
+    assert snap3["disk_misses"] == 1
+    assert snap3["disk_hits"] == 0
+    assert snap3["ram_misses"] == 1

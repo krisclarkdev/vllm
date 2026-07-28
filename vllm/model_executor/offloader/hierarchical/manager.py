@@ -580,7 +580,15 @@ class ExpertTierManager:
         host_rows: dict[int, list[torch.Tensor]] = {}
         needed = [e for e in expert_ids if e >= 0 and not pool.contains(e)]
 
-        t0 = time.perf_counter_ns()
+        unique_pos = [e for e in set(expert_ids) if e >= 0]
+        self.stats.ensure_calls += 1
+        increment_prom(ensure_call=True)
+        n_unique = len(unique_pos)
+        self.stats.unique_experts_sum += n_unique
+        self.stats.unique_experts_hist[n_unique] = (
+            self.stats.unique_experts_hist.get(n_unique, 0) + 1
+        )
+
         # Always materialize host rows for every requested expert up front.
         # Slot eviction within ensure_from_host_rows can invalidate earlier
         # contains() hits from this same batch.
@@ -591,32 +599,48 @@ class ExpertTierManager:
                 continue
             if pool.contains(eid):
                 self.stats.device_hits += 1
-                increment_prom("device")
-                # Still provide a host row in case this slot is evicted while
-                # bringing in other experts from this batch.
+                increment_prom("device", hit=True)
+            else:
+                self.stats.device_misses += 1
+                increment_prom("device", hit=False)
+
             row_view = self._ram.get(layer_id, eid) if self._ram else None
             if row_view is not None:
-                if eid not in host_rows:
-                    self.stats.ram_hits += 1
-                    increment_prom("ram")
+                self.stats.ram_hits += 1
+                increment_prom("ram", hit=True)
                 host_rows[eid] = self._unpack_host_row(state, row_view)
                 continue
-            if self._disk is not None and self._disk.has_layer(layer_id):
-                blob = self._disk.read_row_sync(layer_id, eid)
-                if self._ram and self._ram.enabled:
-                    self._ram.put(layer_id, eid, blob)
-                self.stats.disk_hits += 1
-                increment_prom("disk")
-                host_rows[eid] = self._disk.unpack_row(layer_id, blob)
-                continue
+
+            self.stats.ram_misses += 1
+            increment_prom("ram", hit=False)
+
+            if self._disk is not None:
+                if self._disk.has_layer(layer_id):
+                    t_disk = time.perf_counter_ns()
+                    blob = self._disk.read_row_sync(layer_id, eid)
+                    disk_wait = time.perf_counter_ns() - t_disk
+                    nbytes = int(blob.numel())
+                    self.stats.disk_hits += 1
+                    self.stats.disk_bytes += nbytes
+                    self.stats.disk_wait_ns += disk_wait
+                    increment_prom(
+                        "disk",
+                        hit=True,
+                        disk_bytes=nbytes,
+                        disk_wait_ns=disk_wait,
+                    )
+                    if self._ram and self._ram.enabled:
+                        self._ram.put(layer_id, eid, blob)
+                    host_rows[eid] = self._disk.unpack_row(layer_id, blob)
+                    continue
+                self.stats.disk_misses += 1
+                increment_prom("disk", hit=False)
+
             if eid >= state.num_experts:
                 raise KeyError(
                     f"layer {layer_id}: expert id {eid} out of range "
                     f"for host pack size {state.num_experts}"
                 )
-            if not pool.contains(eid):
-                self.stats.ram_hits += 1
-                increment_prom("ram")
             host_rows[eid] = [w[eid] for w in state.host_weights]
             if self._ram and self._ram.enabled:
                 packed = pack_expert_row_torch(host_rows[eid])
@@ -624,22 +648,19 @@ class ExpertTierManager:
 
         remap, events = pool.ensure_from_host_rows(expert_ids, host_rows)
 
-        # Wait for in-flight copies of experts we need
+        # Stall is only time blocked waiting on the copy stream / events.
+        t_stall = time.perf_counter_ns()
         compute = current_platform.current_stream()
         for ev in events:
             compute.wait_event(ev)
+        h2d_stall = time.perf_counter_ns() - t_stall
         pool.mark_ready(list(remap.keys()))
 
-        stall = time.perf_counter_ns() - t0
-        self.stats.stall_ns += stall
-        self.stats.ensures += 1
-        self.stats.unique_experts += len(set(expert_ids))
-        dma = sum(
-            state.row_nbytes for e in needed if e in remap
-        )
-        self.stats.dma_bytes += dma
-        if dma:
-            increment_prom("device", dma_bytes=dma, stall_ns=stall)
+        self.stats.h2d_stall_ns += h2d_stall
+        dma = sum(state.row_nbytes for e in needed if e in remap)
+        self.stats.h2d_bytes += dma
+        if dma or h2d_stall:
+            increment_prom("device", h2d_bytes=dma, h2d_stall_ns=h2d_stall)
 
         if record_usage and self._usage is not None:
             self._usage.record(layer_id, expert_ids)
