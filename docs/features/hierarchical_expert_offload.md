@@ -235,7 +235,7 @@ slots (placement).
 VLLM_ENABLE_V1_MULTIPROCESSING=0 .venv/bin/python \
   benchmarks/hierarchical_expert_atlas.py \
   --model /path/to/moe \
-  --probes benchmarks/hierarchical_atlas_probes.example.json \
+  --probes benchmarks/hierarchical_atlas_probes.example.json.txt \
   --tier-num-slots 4 --tier-ram-gb 8 \
   --output /nvme/expert_store/.vllm_expert_atlas.json
 

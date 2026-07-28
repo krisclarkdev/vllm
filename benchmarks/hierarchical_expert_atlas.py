@@ -15,7 +15,7 @@ Examples:
   VLLM_ENABLE_V1_MULTIPROCESSING=0 .venv/bin/python \\
     benchmarks/hierarchical_expert_atlas.py \\
     --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \\
-    --probes benchmarks/hierarchical_atlas_probes.example.json \\
+    --probes benchmarks/hierarchical_atlas_probes.example.json.txt \\
     --tier-num-slots 4 --tier-ram-gb 8 \\
     --output /tmp/.vllm_expert_atlas.json
 """
