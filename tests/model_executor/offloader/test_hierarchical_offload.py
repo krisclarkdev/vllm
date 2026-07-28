@@ -794,3 +794,71 @@ def test_mirrored_reader_bytes_on_both_volumes(tmp_path: Path):
     assert isinstance(solo, ExpertStoreReader)
     assert solo.read_row_sync(0, 0).numel() > 0
     solo.close()
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="Requires CUDA or XPU for device slot DMA",
+)
+def test_slot_pool_pointer_stability():
+    """Slot-backed param buffers must keep a stable data_ptr across ensures."""
+    device = torch.device(f"{current_platform.device_type}:0")
+    E, H, I = 8, 8, 8
+    host_w13 = torch.randn(E, 2 * I, H)
+    host_w2 = torch.randn(E, H, I)
+    stream = current_platform.Stream()
+    pool = ExpertSlotPool(
+        layer_id=0,
+        weight_templates=[host_w13, host_w2],
+        num_slots=4,
+        copy_stream=stream,
+        device=device,
+    )
+    ptrs0 = pool.slot_data_ptrs()
+    host_rows = {e: [host_w13[e], host_w2[e]] for e in range(E)}
+    compute = current_platform.current_stream()
+    for batch in ([0, 1, 2, 3], [4, 5, 6, 7], [0, 2, 4, 6], [1, 3, 5, 7]):
+        remap, events = pool.ensure_from_host_rows(batch, host_rows)
+        for ev in events:
+            compute.wait_event(ev)
+        pool.mark_ready(list(remap.keys()))
+        pool.assert_pointer_stable()
+        assert pool.slot_data_ptrs() == ptrs0
+
+
+def test_tier_allow_cuda_graphs_default_forces_eager_doc():
+    """Hierarchical defaults to eager unless --tier-allow-cuda-graphs."""
+    cfg = HierarchicalOffloadConfig()
+    assert cfg.tier_allow_cuda_graphs is False
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="Requires CUDA or XPU",
+)
+def test_hierarchical_graph_opt_in_smoke():
+    """Guarded smoke: with tier_allow_cuda_graphs, config stays non-eager opt-in.
+
+    Full XPU/CUDA graph capture of MoE+remap is not claimed; this only checks
+    the flag plumbing. Skip deeper graph capture unless the platform reports
+    graph support.
+    """
+    cfg = HierarchicalOffloadConfig(
+        tier_num_slots=2, tier_ram_gb=0.01, tier_allow_cuda_graphs=True
+    )
+    assert cfg.tier_allow_cuda_graphs is True
+    # Platform-specific graph capability probe (best-effort).
+    has_graphs = False
+    try:
+        if current_platform.is_cuda():
+            has_graphs = hasattr(torch.cuda, "CUDAGraph")
+        elif current_platform.is_xpu():
+            import os
+
+            has_graphs = os.environ.get("VLLM_XPU_ENABLE_XPU_GRAPH", "0") == "1"
+    except Exception:
+        has_graphs = False
+    if not has_graphs:
+        pytest.skip("No CUDA/XPU graph runtime enabled for deeper smoke")
+    # Deeper capture is out of scope for PR-E honesty matrix.
+    pytest.skip("Full MoE+remap graph capture not supported; see docs matrix")

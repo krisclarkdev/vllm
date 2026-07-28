@@ -56,6 +56,10 @@ class ExpertSlotPool:
         self.expert_to_slot: dict[int, int] = {}
         self._generation = 0
         self._free: list[int] = list(range(num_slots))
+        # Address-stable storage for graphs: slot_weights are never reallocated.
+        self._slot_data_ptrs: tuple[int, ...] = tuple(
+            int(w.data_ptr()) for w in self.slot_weights
+        )
 
         logger.debug(
             "ExpertSlotPool layer=%d slots=%d full_E=%d device=%s",
@@ -64,6 +68,19 @@ class ExpertSlotPool:
             self.num_experts_full,
             device,
         )
+
+    def slot_data_ptrs(self) -> tuple[int, ...]:
+        """Return ``data_ptr`` for each slot-backed weight buffer."""
+        return tuple(int(w.data_ptr()) for w in self.slot_weights)
+
+    def assert_pointer_stable(self) -> None:
+        """Raise if any slot buffer was reallocated (breaks graph capture)."""
+        cur = self.slot_data_ptrs()
+        if cur != self._slot_data_ptrs:
+            raise RuntimeError(
+                f"layer {self.layer_id}: expert slot buffer data_ptr changed "
+                f"(was {self._slot_data_ptrs}, now {cur}); in-place H2D only"
+            )
 
     def contains(self, expert_id: int) -> bool:
         return expert_id in self.expert_to_slot
@@ -151,6 +168,7 @@ class ExpertSlotPool:
             remap[eid] = sid
             events.append(event)
             protect.add(eid)
+        self.assert_pointer_stable()
         return remap, events
 
     def mark_ready(self, expert_ids: list[int]) -> None:

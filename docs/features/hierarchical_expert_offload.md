@@ -159,6 +159,30 @@ With `--tier-numa` / `VLLM_TIER_NUMA=1` on a multi-node Linux host that has
 ``numa_interleave_memory`` after allocation. Unsupported hosts log once and
 keep default OS placement.
 
+### Activation pipeline (CUDA_PIPE spirit)
+
+Hidden states / activations stay **on-device** through router → ensure → MoE
+GEMM. `wait_ensure` joins only **weight** H2D events on the hierarchical copy
+stream (not activations). Expert *ids* are still materialized on the host
+(`torch.unique→tolist`) for slot/RAM/disk lookup; that D2H is counted as
+`host_expert_id_syncs` and logged once.
+
+Device slot packs are allocated once; in-place row copies keep
+`param.data_ptr()` stable across ensures (required for any future MoE graph
+experiments).
+
+### Experimental graphs
+
+| Mode | Hierarchical default | Notes |
+|------|----------------------|-------|
+| Eager MoE + overlapped H2D | **Default** (`enforce_eager`) | Supported |
+| Piecewise / attention graphs | `--tier-allow-cuda-graphs` | MoE region stays eager; remaps outside capture |
+| Full-graph MoE + dynamic remap | **Not supported** | Slot ptrs are stable, but unique expert sets change per step |
+
+Requires platform graph enablement (e.g. `VLLM_XPU_ENABLE_XPU_GRAPH=1` on
+XPU). Graph boundaries still drain the copy stream via
+`sync_prev_onload` / `join_after_forward`.
+
 ## Metrics
 
 Prometheus (when enabled):
