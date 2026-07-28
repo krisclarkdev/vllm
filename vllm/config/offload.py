@@ -142,6 +142,16 @@ class HierarchicalOffloadConfig:
     """Path for the learned expert-usage heat map. Defaults to
     ``{tier_disk_path}/.vllm_expert_usage`` or beside the model."""
 
+    tier_atlas_path: str | None = None
+    """Optional expert atlas JSON (``.vllm_expert_atlas.json``). When set with
+    ``tier_affinity_topic``, cold-start / seed pins boost experts measured for
+    that topic. Placement only — never changes router outputs. Unset = pure
+    LFRU/usage (default hierarchical behavior)."""
+
+    tier_affinity_topic: str | None = None
+    """Explicit topic id from the atlas (v1: no auto keyword detect). Ignored
+    unless ``tier_atlas_path`` loads successfully."""
+
     tier_dense_prefetch: bool = False
     """Also apply PrefetchOffloader-style staging to dense (attention) weights
     when device budget remains tight after expert slots."""

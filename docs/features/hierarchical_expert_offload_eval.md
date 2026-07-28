@@ -227,4 +227,35 @@ Acceptance for merge: unit tests green; no draft/verify expert desync under
 SPEC_PIN; PR body includes support matrix from
 `hierarchical_expert_offload.md` and any hardware smoke numbers available.
 
+## PR-G expert atlas + affinity pins (optional)
+
+Unit: atlas round-trip + `affinity_hottest` prefers tagged topic experts
+(`test_expert_atlas_*` in `test_hierarchical_offload.py`). Default hierarchical
+path unchanged when `--tier-atlas-path` unset.
+
+```bash
+# Build atlas (merge mode for CI; live probes on hal)
+.venv/bin/python benchmarks/hierarchical_expert_atlas.py \
+  --merge-json /tmp/atlas_counts.json \
+  --output /tmp/.vllm_expert_atlas.json
+
+# Affinity vs cold bakeoff (same prompts / slots)
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 4 --tier-ram-gb 8 --warm 0 --max-tokens 32 \
+  --prompt "Write a Python function that merges two sorted lists." \
+  --output /tmp/hier_pr_g_cold.json
+
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 4 --tier-ram-gb 8 --warm 0 --max-tokens 32 \
+  --tier-atlas-path /tmp/.vllm_expert_atlas.json \
+  --tier-affinity-topic code \
+  --prompt "Write a Python function that merges two sorted lists." \
+  --output /tmp/hier_pr_g_affinity.json
+```
+
+Compare `tier_stats.device_hit_rate` / `ram_hit_rate` and `tok_s_warm`. Atlas
+is placement-only.
+
 AI assistance was used for this feature implementation.
