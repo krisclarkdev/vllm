@@ -25,7 +25,7 @@ driver (default in the harness via `VLLM_ENABLE_V1_MULTIPROCESSING=0`):
 .venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
   --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
   --tier-num-slots 4 --tier-ram-gb 8 --warm 4 --max-tokens 32 \
-  --num-prompts 4 --output /tmp/hier_pr_a_bakeoff.json
+  --num-prompts 4 --prompt Hi --output /tmp/hier_pr_a_bakeoff.json
 
 # Baseline in a separate invocation
 .venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
@@ -40,7 +40,7 @@ driver (default in the harness via `VLLM_ENABLE_V1_MULTIPROCESSING=0`):
   --output /tmp/hier_pr_a_compare.json
 ```
 
-Use `--tier-num-slots 4` (of 8 experts) so staging is exercised; raise to 8
+Default `--prompt Hi` keeps unique experts within a 4-slot budget; longer prompts may raise `cannot allocate a slot`. Use `--tier-num-slots 4` (of 8 experts) so staging is exercised; raise to 8
 for full residency (less interesting for hit-rate metrics). Optional:
 `--colibri-tok-s <float>`, `--measure-prefill`.
 

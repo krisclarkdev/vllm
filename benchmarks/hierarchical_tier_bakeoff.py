@@ -54,6 +54,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tier-pilot", action="store_true")
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--num-prompts", type=int, default=4)
+    p.add_argument(
+        "--prompt",
+        default="Hi",
+        help="Prompt text (default short 'Hi' so slots=4 smoke stays within "
+        "unique-expert budget; longer prompts may need more slots)",
+    )
     p.add_argument("--warm", type=int, default=4, help="Warmup generate steps")
     p.add_argument("--max-model-len", type=int, default=1024)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -133,8 +139,9 @@ def _run_bakeoff(args: argparse.Namespace) -> None:
     from vllm import LLM, SamplingParams
     from vllm.model_executor.offloader.hierarchical.manager import get_tier_manager
 
+    base = args.prompt.strip() or "Hi"
     prompts = [
-        f"Explain mixture-of-experts inference briefly. Example #{i}."
+        base if args.num_prompts == 1 else f"{base} #{i}."
         for i in range(max(args.num_prompts, 1))
     ]
     sampling = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
