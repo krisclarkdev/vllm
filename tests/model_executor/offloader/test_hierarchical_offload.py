@@ -502,7 +502,8 @@ def test_tier_stats_move_on_fake_ensure(monkeypatch):
     def contains(eid: int) -> bool:
         return eid in resident
 
-    def ensure_from_host_rows(ids, host_rows):
+    def ensure_from_host_rows(ids, host_rows, *, extra_protect=None):
+        del extra_protect
         remap: dict[int, int] = {}
         for eid in ids:
             if eid < 0:
@@ -698,7 +699,8 @@ def test_schedule_wait_ordering(monkeypatch):
     def contains(eid: int) -> bool:
         return eid in resident
 
-    def ensure_from_host_rows(ids, host_rows):
+    def ensure_from_host_rows(ids, host_rows, *, extra_protect=None):
+        del extra_protect
         remap: dict[int, int] = {}
         events = []
         for eid in ids:
