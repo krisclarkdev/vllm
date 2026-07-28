@@ -38,6 +38,7 @@ class _Arena:
         row_nbytes: int,
         *,
         pin_memory: bool,
+        numa: bool = False,
     ):
         self.name = name
         self.row_nbytes = row_nbytes
@@ -50,10 +51,14 @@ class _Arena:
         self.num_frames = num_frames
         self._arena: torch.Tensor | None = None
         if num_frames > 0 and row_nbytes > 0:
-            self._arena = torch.empty(
+            from vllm.model_executor.offloader.hierarchical.numa_pin import (
+                allocate_uint8_arena,
+            )
+
+            self._arena = allocate_uint8_arena(
                 num_frames * row_nbytes,
-                dtype=torch.uint8,
                 pin_memory=pin_memory,
+                numa=numa,
             )
         self._frames: list[RamFrame] = [
             RamFrame(
@@ -97,6 +102,7 @@ class PinnedExpertRamCache:
         *,
         pageable_capacity_bytes: int | None = None,
         device: torch.device | None = None,
+        numa: bool = False,
     ):
         self.row_nbytes = row_nbytes
         pin = should_pin_memory()
@@ -107,20 +113,25 @@ class PinnedExpertRamCache:
             else max(capacity_bytes, row_nbytes)
         )
         self._pinned = _Arena(
-            "pinned", capacity_bytes, row_nbytes, pin_memory=pin
+            "pinned",
+            capacity_bytes,
+            row_nbytes,
+            pin_memory=pin,
+            numa=numa and pin,
         )
         self._pageable = _Arena(
-            "pageable", pageable_bytes, row_nbytes, pin_memory=False
+            "pageable", pageable_bytes, row_nbytes, pin_memory=False, numa=False
         )
         self._index: dict[tuple[int, int], tuple[str, int]] = {}
         self._clock = 0.0
         if self._pinned.enabled or self._pageable.enabled:
             logger.info(
-                "PinnedExpertRamCache: pinned=%d frames (%.3f GiB, pin=%s); "
-                "pageable=%d frames (%.3f GiB)",
+                "PinnedExpertRamCache: pinned=%d frames (%.3f GiB, pin=%s, "
+                "numa=%s); pageable=%d frames (%.3f GiB)",
                 self._pinned.num_frames,
                 self._pinned.capacity_bytes / 1024**3,
                 pin,
+                numa and pin,
                 self._pageable.num_frames,
                 self._pageable.capacity_bytes / 1024**3,
             )
