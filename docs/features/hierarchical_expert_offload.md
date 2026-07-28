@@ -125,19 +125,30 @@ pinned budget instead of blindly using `pin_memory=False`.
    unique expert ids, ensures they are in slots (RAM hit → DMA, disk miss →
    O_DIRECT/io thread → DMA), and **remaps** `topk_ids` to slot indices.
    Full residency skips ensure churn after the initial fill.
-4. Optional **PILOT** prefetches the next layer’s experts from a routing hint.
+4. Optional **PILOT** (`--tier-pilot`) schedules next-layer experts after the
+   current ensure wait so DMA can overlap this layer’s expert GEMM. With
+   `--tier-pilot-real`, the next layer’s registered gate runs on the current
+   hidden state (extra gate cost) instead of reusing the current topk hint.
 5. **Learned pins** (`.vllm_expert_usage`) seed device slots + pinned RAM at
    `post_init`; with `--tier-policy balanced`, `notify_tokens` from the worker
    triggers live LFRU `repin_hottest` every `--tier-repin-tokens`. Usage is
    flushed periodically and on shutdown.
+
+Ensure is split into **schedule** (kick H2D on the hierarchical copy stream)
+and **wait** (block immediately before the MoE GEMM); wait time goes to
+`h2d_stall_ns`. ExpertStore reads prefer aligned `O_DIRECT` windows; failures
+increment `disk_direct_fallback` and use buffered I/O. Demand I/O outranks
+PILOT prefetch in the disk worker queue.
 
 ## Metrics
 
 Prometheus (when enabled):
 
 - `vllm_tier_expert_hits_total{tier=device|ram|disk}`
-- `vllm_tier_expert_dma_bytes_total`
-- `vllm_tier_expert_stall_seconds_total`
+- `vllm_tier_expert_h2d_bytes_total` / `vllm_tier_expert_h2d_stall_seconds_total`
+- `vllm_tier_expert_disk_direct_fallback_total`
+- `vllm_tier_expert_pilot_predict_hits_total` /
+  `vllm_tier_expert_pilot_predict_misses_total`
 - `vllm_tier_expert_device_hit_rate`
 
 ## Limitations (v1)

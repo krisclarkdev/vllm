@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.hierarchical.device_slots import ExpertSlotPool
 from vllm.model_executor.offloader.hierarchical.disk_store import (
     ExpertStoreReader,
+    IoPriority,
     ensure_store_or_none,
 )
 from vllm.model_executor.offloader.hierarchical.format import (
@@ -43,6 +45,19 @@ if TYPE_CHECKING:
     from vllm.model_executor.offloader.hierarchical.pilot import PilotPrefetcher
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class PendingEnsure:
+    """In-flight ensure: H2D started on the copy stream, wait deferred."""
+
+    layer_id: int
+    remapped_topk: torch.Tensor
+    events: list = field(default_factory=list)
+    needed: list[int] = field(default_factory=list)
+    row_nbytes: int = 0
+    usage_ids: list[int] | None = None
+    local_ids: list[int] = field(default_factory=list)
 
 _WEIGHT_PARAM_NAMES = (
     # Unquantized / MXFP4 / compressed-tensors style
@@ -123,6 +138,9 @@ class ExpertTierManager:
         self._initialized = False
         self._model_path = model_path
         self._pending_modules: list[tuple[int, nn.Module]] = []
+        # MoE gates registered before/after pilot construction.
+        self._pending_gates: list[tuple[int, nn.Module]] = []
+        self._disk_fallback_seen = 0
         # MoE expert modules still holding full packs on device during
         # construct/load. Oldest are spilled to host only under VRAM pressure
         # so we use GPU+RAM together instead of host-only (which causes swap).
@@ -134,6 +152,13 @@ class ExpertTierManager:
     def register_moe_module(self, layer_id: int, module: nn.Module) -> None:
         """Queue a RoutedExperts (or parent) module for post_init staging."""
         self._pending_modules.append((layer_id, module))
+
+    def register_gate(self, layer_id: int, gate: nn.Module) -> None:
+        """Register a MoE gate for PILOT; applied when pilot is constructed."""
+        if self._pilot is not None:
+            self._pilot.register_gate(layer_id, gate)
+        else:
+            self._pending_gates.append((layer_id, gate))
 
     def _device_mem_bytes(self) -> tuple[int, int]:
         """Return (free, total) device bytes; conservative fallback on error."""
@@ -401,6 +426,14 @@ class ExpertTierManager:
             )
 
             self._pilot = PilotPrefetcher(self, real=self.config.tier_pilot_real)
+            for gid, gate in self._pending_gates:
+                self._pilot.register_gate(gid, gate)
+            self._pending_gates.clear()
+            logger.info(
+                "PILOT enabled (real_gate=%s, gates_registered=%d)",
+                self.config.tier_pilot_real,
+                len(self._pilot._gates),
+            )
 
         self._pending_modules.clear()
         self._initialized = True
@@ -539,13 +572,19 @@ class ExpertTierManager:
         self, layer_id: int, topk_ids: torch.Tensor
     ) -> torch.Tensor:
         """Ensure experts for ``topk_ids`` are on device; return remapped ids."""
+        pending = self.schedule_ensure_and_remap(layer_id, topk_ids)
+        return self.wait_ensure(pending)
+
+    def schedule_ensure_and_remap(
+        self, layer_id: int, topk_ids: torch.Tensor
+    ) -> PendingEnsure:
+        """Start staging for ``topk_ids`` without waiting on H2D events."""
         if layer_id not in self.layers:
-            return topk_ids
+            return PendingEnsure(layer_id=layer_id, remapped_topk=topk_ids)
 
         state = self.layers[layer_id]
         flat = topk_ids.reshape(-1)
         unique = torch.unique(flat).tolist()
-        # Router ids may be global; convert to local pack indices first.
         global_to_local: dict[int, int] = {}
         local_ids: list[int] = []
         for gid in unique:
@@ -558,18 +597,63 @@ class ExpertTierManager:
             global_to_local[g] = local
             local_ids.append(local)
 
-        local_remap = self._ensure_layer(
-            layer_id, list(set(local_ids)), record_usage=True
+        # Score prior PILOT prediction against this layer's real topk.
+        if self._pilot is not None:
+            self._pilot.score_prediction(layer_id, list(set(local_ids)))
+
+        local_remap, events, needed = self._schedule_ensure_layer(
+            layer_id,
+            list(set(local_ids)),
+            record_usage=True,
+            io_priority=IoPriority.DEMAND,
         )
 
-        # Remap original (global) topk ids → slot ids for the kernel.
         remapped = topk_ids.clone()
         for gid, local in global_to_local.items():
             sid = local_remap.get(local)
             if sid is None:
                 continue
             remapped = torch.where(topk_ids == gid, sid, remapped)
-        return remapped
+
+        return PendingEnsure(
+            layer_id=layer_id,
+            remapped_topk=remapped,
+            events=events,
+            needed=needed,
+            row_nbytes=state.row_nbytes,
+            usage_ids=list(set(local_ids)),
+            local_ids=list(set(local_ids)),
+        )
+
+    def wait_ensure(self, pending: PendingEnsure) -> torch.Tensor:
+        """Wait for scheduled H2D; attribute stall time to ``h2d_stall_ns``."""
+        if (
+            not pending.events
+            and not pending.needed
+            and pending.usage_ids is None
+        ):
+            return pending.remapped_topk
+
+        t_stall = time.perf_counter_ns()
+        compute = current_platform.current_stream()
+        for ev in pending.events:
+            compute.wait_event(ev)
+        h2d_stall = time.perf_counter_ns() - t_stall
+
+        if pending.layer_id in self.layers:
+            pool = self.layers[pending.layer_id].slot_pool
+            pool.mark_ready(pending.local_ids)
+
+        self.stats.h2d_stall_ns += h2d_stall
+        dma = pending.row_nbytes * len(pending.needed)
+        self.stats.h2d_bytes += dma
+        if dma or h2d_stall:
+            increment_prom("device", h2d_bytes=dma, h2d_stall_ns=h2d_stall)
+
+        if pending.usage_ids is not None and self._usage is not None:
+            self._usage.record(pending.layer_id, pending.usage_ids)
+
+        return pending.remapped_topk
 
     def maybe_pilot_prefetch(
         self,
@@ -587,9 +671,26 @@ class ExpertTierManager:
     ) -> None:
         if layer_id not in self.layers:
             return
-        self._ensure_layer(layer_id, expert_ids, record_usage=False)
-        if block:
-            current_platform.current_stream().wait_stream(self.copy_stream)
+        _remap, events, needed = self._schedule_ensure_layer(
+            layer_id,
+            expert_ids,
+            record_usage=False,
+            io_priority=IoPriority.PILOT,
+        )
+        if block and events:
+            pending = PendingEnsure(
+                layer_id=layer_id,
+                remapped_topk=torch.empty(0),
+                events=events,
+                needed=needed,
+                row_nbytes=self.layers[layer_id].row_nbytes,
+                usage_ids=None,
+                local_ids=list({e for e in expert_ids if e >= 0}),
+            )
+            self.wait_ensure(pending)
+        elif events:
+            # Leave slot.pending + events for a later demand wait_ensure.
+            pass
 
     def notify_tokens(self, n: int) -> None:
         """Advance repin clock by ``n`` emitted tokens; flush usage periodically."""
@@ -629,6 +730,50 @@ class ExpertTierManager:
         *,
         record_usage: bool,
     ) -> dict[int, int]:
+        """Synchronous ensure (schedule + wait) used by post_init warm fill."""
+        remap, events, needed = self._schedule_ensure_layer(
+            layer_id,
+            expert_ids,
+            record_usage=False,
+            io_priority=IoPriority.DEMAND,
+        )
+        pending = PendingEnsure(
+            layer_id=layer_id,
+            remapped_topk=torch.empty(0),
+            events=events,
+            needed=needed,
+            row_nbytes=self.layers[layer_id].row_nbytes,
+            usage_ids=list({e for e in expert_ids if e >= 0})
+            if record_usage
+            else None,
+            local_ids=list({e for e in expert_ids if e >= 0}),
+        )
+        self.wait_ensure(pending)
+        full: dict[int, int] = {}
+        pool = self.layers[layer_id].slot_pool
+        for eid in expert_ids:
+            if eid < 0:
+                continue
+            sid = pool.slot_of(eid)
+            if sid is not None:
+                full[eid] = sid
+        full.update(remap)
+        return full
+
+    def _schedule_ensure_layer(
+        self,
+        layer_id: int,
+        expert_ids: list[int],
+        *,
+        record_usage: bool,
+        io_priority: IoPriority = IoPriority.DEMAND,
+    ) -> tuple[dict[int, int], list, list[int]]:
+        """Materialize host rows and kick H2D; do not wait on the copy stream.
+
+        Returns ``(local_remap, events, needed_expert_ids)``.
+        ``record_usage`` is deferred to ``wait_ensure`` via PendingEnsure.
+        """
+        del record_usage  # usage recorded in wait_ensure when requested
         state = self.layers[layer_id]
         pool = state.slot_pool
         unique_pos = [e for e in set(expert_ids) if e >= 0]
@@ -646,8 +791,6 @@ class ExpertTierManager:
             for eid in unique_pos:
                 self.stats.device_hits += 1
                 increment_prom("device", hit=True)
-            if record_usage and self._usage is not None:
-                self._usage.record(layer_id, expert_ids)
             full: dict[int, int] = {}
             for eid in expert_ids:
                 if eid < 0:
@@ -655,14 +798,13 @@ class ExpertTierManager:
                 sid = pool.slot_of(eid)
                 if sid is not None:
                     full[eid] = sid
-            return full
+            return full, [], []
 
         host_rows: dict[int, list[torch.Tensor]] = {}
         needed = [e for e in expert_ids if e >= 0 and not pool.contains(e)]
 
-        # Always materialize host rows for every requested expert up front.
-        # Slot eviction within ensure_from_host_rows can invalidate earlier
-        # contains() hits from this same batch.
+        # Batch disk misses into coalesced priority reads.
+        disk_miss_ids: list[int] = []
         for eid in expert_ids:
             if eid < 0:
                 continue
@@ -685,25 +827,11 @@ class ExpertTierManager:
             self.stats.ram_misses += 1
             increment_prom("ram", hit=False)
 
+            if self._disk is not None and self._disk.has_layer(layer_id):
+                disk_miss_ids.append(eid)
+                continue
+
             if self._disk is not None:
-                if self._disk.has_layer(layer_id):
-                    t_disk = time.perf_counter_ns()
-                    blob = self._disk.read_row_sync(layer_id, eid)
-                    disk_wait = time.perf_counter_ns() - t_disk
-                    nbytes = int(blob.numel())
-                    self.stats.disk_hits += 1
-                    self.stats.disk_bytes += nbytes
-                    self.stats.disk_wait_ns += disk_wait
-                    increment_prom(
-                        "disk",
-                        hit=True,
-                        disk_bytes=nbytes,
-                        disk_wait_ns=disk_wait,
-                    )
-                    if self._ram and self._ram.enabled:
-                        self._ram.put(layer_id, eid, blob)
-                    host_rows[eid] = self._disk.unpack_row(layer_id, blob)
-                    continue
                 self.stats.disk_misses += 1
                 increment_prom("disk", hit=False)
 
@@ -717,35 +845,47 @@ class ExpertTierManager:
                 packed = pack_expert_row_torch(host_rows[eid])
                 self._ram.put(layer_id, eid, packed)
 
+        if disk_miss_ids and self._disk is not None:
+            # Deduplicate while preserving order for coalesce.
+            seen: set[int] = set()
+            ordered_miss: list[int] = []
+            for eid in disk_miss_ids:
+                if eid not in seen:
+                    seen.add(eid)
+                    ordered_miss.append(eid)
+            t_disk = time.perf_counter_ns()
+            # Sync path via priority pool so demand beats in-flight PILOT.
+            fut = self._disk.read_rows_async(
+                layer_id, ordered_miss, priority=io_priority
+            )
+            blobs = fut.result()
+            disk_wait = time.perf_counter_ns() - t_disk
+            # Sync fallbacks that happened inside the reader.
+            if self._disk.disk_direct_fallback:
+                delta = self._disk.disk_direct_fallback
+                # Only count newly observed fallbacks once per reader lifetime
+                # into stats by tracking last seen.
+                prev = getattr(self, "_disk_fallback_seen", 0)
+                if delta > prev:
+                    inc = delta - prev
+                    self.stats.disk_direct_fallback += inc
+                    increment_prom(disk_direct_fallback=inc)
+                    self._disk_fallback_seen = delta
+            for eid in ordered_miss:
+                blob = blobs[eid]
+                nbytes = int(blob.numel())
+                self.stats.disk_hits += 1
+                self.stats.disk_bytes += nbytes
+                increment_prom("disk", hit=True, disk_bytes=nbytes)
+                if self._ram and self._ram.enabled:
+                    self._ram.put(layer_id, eid, blob)
+                host_rows[eid] = self._disk.unpack_row(layer_id, blob)
+            self.stats.disk_wait_ns += disk_wait
+            if disk_wait:
+                increment_prom(disk_wait_ns=disk_wait)
+
         remap, events = pool.ensure_from_host_rows(expert_ids, host_rows)
-
-        # Stall is only time blocked waiting on the copy stream / events.
-        t_stall = time.perf_counter_ns()
-        compute = current_platform.current_stream()
-        for ev in events:
-            compute.wait_event(ev)
-        h2d_stall = time.perf_counter_ns() - t_stall
-        pool.mark_ready(list(remap.keys()))
-
-        self.stats.h2d_stall_ns += h2d_stall
-        dma = sum(state.row_nbytes for e in needed if e in remap)
-        self.stats.h2d_bytes += dma
-        if dma or h2d_stall:
-            increment_prom("device", h2d_bytes=dma, h2d_stall_ns=h2d_stall)
-
-        if record_usage and self._usage is not None:
-            self._usage.record(layer_id, expert_ids)
-
-        # Build full remap including already-resident
-        full: dict[int, int] = {}
-        for eid in expert_ids:
-            if eid < 0:
-                continue
-            sid = pool.slot_of(eid)
-            if sid is not None:
-                full[eid] = sid
-        full.update(remap)
-        return full
+        return remap, events, needed
 
     def _unpack_host_row(
         self, state: LayerTierState, row_view: torch.Tensor

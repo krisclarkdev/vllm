@@ -65,6 +65,27 @@ def expert_file_name(layer_id: int) -> str:
     return f"L{layer_id:03d}.experts"
 
 
+def coalesce_expert_ranges(expert_ids: list[int]) -> list[tuple[int, int]]:
+    """Coalesce expert ids into inclusive ``(start, end)`` contiguous ranges.
+
+    ExpertStore layout stores one packed row per expert contiguously, so a
+    single pread can cover ``[start, end]``.
+    """
+    ids = sorted({int(e) for e in expert_ids if int(e) >= 0})
+    if not ids:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = prev = ids[0]
+    for eid in ids[1:]:
+        if eid == prev + 1:
+            prev = eid
+            continue
+        ranges.append((start, prev))
+        start = prev = eid
+    ranges.append((start, prev))
+    return ranges
+
+
 def row_nbytes_from_tensors(tensors: list[torch.Tensor]) -> int:
     return sum(t.numel() * t.element_size() for t in tensors)
 
