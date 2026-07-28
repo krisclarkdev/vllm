@@ -64,6 +64,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int, default=1024)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     p.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=1,
+        help="Keep small so unique experts per step fit in --tier-num-slots",
+    )
+    p.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=1,
+        help="1 = one token/step (Mixtral top-2 fits in 4 slots); raise for throughput",
+    )
+    p.add_argument(
         "--baseline",
         action="store_true",
         help="Run without hierarchical offload (separate invocation)",
@@ -151,6 +163,8 @@ def _run_bakeoff(args: argparse.Namespace) -> None:
         "model": args.model,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_num_seqs": args.max_num_seqs,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
         "enforce_eager": True,
         "trust_remote_code": True,
     }
@@ -235,6 +249,9 @@ def _run_bakeoff(args: argparse.Namespace) -> None:
             "tier_pilot": None if args.baseline else args.tier_pilot,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_num_seqs": args.max_num_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "prompt": args.prompt,
             "v1_multiprocessing": os.environ.get(
                 "VLLM_ENABLE_V1_MULTIPROCESSING", "1"
             ),
