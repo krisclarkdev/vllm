@@ -170,4 +170,18 @@ claiming a win.
 | slots=4 no pilot | ~1.09 | ~104 | ~0.990 | `/tmp/hier_pr_c_nopilot.json` |
 | slots=4 + pilot | ~0.51 | ~114 | ~0.828 | `/tmp/hier_pr_c_pilot.json`; predict hit ~0.64 |
 
+## PR-D dual NVMe + NUMA
+
+```bash
+vllm serve <moe> --offload-backend hierarchical \
+  --tier-disk-path /nvme0/expert_store \
+  --tier-disk-mirror /nvme1/expert_store \
+  --tier-disk-weights 1,1 \
+  --tier-numa
+```
+
+Acceptance: dual-path reads show non-zero `disk_bytes_primary` and
+`disk_bytes_mirror` (or `MIRROR:` log); single-disk path unchanged when mirror
+is unset. Unit tests cover hash stability, partial mirror, and mirror fallback.
+
 AI assistance was used for this feature implementation.

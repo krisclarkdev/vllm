@@ -299,10 +299,15 @@ class ExpertTierManager:
         # RAM cache: OS-pinned hot arena capped to budget; pageable overflow.
         ram_budget = resolve_ram_budget_bytes(self.config)
         self._pinned_host_budget = ram_budget
+        from vllm.model_executor.offloader.hierarchical.mirror import (
+            resolve_tier_numa,
+        )
+
         self._ram = PinnedExpertRamCache(
             ram_budget,
             row_nbytes,
             pageable_capacity_bytes=max(ram_budget, row_nbytes * slots * 4),
+            numa=resolve_tier_numa(self.config.tier_numa),
         )
 
         usage_path = self.config.tier_usage_path or default_usage_path(
@@ -314,6 +319,8 @@ class ExpertTierManager:
             self.config.tier_disk_path,
             num_workers=self.config.tier_io_workers,
             prefer_direct=self.config.tier_direct,
+            disk_mirror=self.config.tier_disk_mirror,
+            disk_weights=self.config.tier_disk_weights,
         )
 
         for layer_id, module in self._pending_modules:
@@ -362,6 +369,8 @@ class ExpertTierManager:
                     self.config.tier_disk_path,
                     num_workers=self.config.tier_io_workers,
                     prefer_direct=self.config.tier_direct,
+                    disk_mirror=self.config.tier_disk_mirror,
+                    disk_weights=self.config.tier_disk_weights,
                 )
 
             # Seed RAM (pinned hot) from usage heat + initial fill.
@@ -720,6 +729,14 @@ class ExpertTierManager:
         if self._usage is not None:
             self._usage.flush()
         if self._disk is not None:
+            # Pull per-volume bytes into TierStats before close logs MIRROR:.
+            stats_fn = getattr(self._disk, "mirror_stats", None)
+            if callable(stats_fn):
+                ms = stats_fn()
+                self.stats.disk_bytes_primary = int(ms.get("primary_bytes", 0))
+                self.stats.disk_bytes_mirror = int(ms.get("mirror_bytes", 0))
+            elif hasattr(self._disk, "bytes_served"):
+                self.stats.disk_bytes_primary = int(self._disk.bytes_served)
             self._disk.close()
         record_stats(self.stats)
 

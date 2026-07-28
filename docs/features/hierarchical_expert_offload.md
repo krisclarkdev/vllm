@@ -52,6 +52,9 @@ vllm serve <moe-model> \
 | `--tier-device-expert-gb` | Max GiB for device expert slots |
 | `--tier-ram-gb` | Pinned RAM cache GiB (`-1` = auto) |
 | `--tier-disk-path` | ExpertStore directory |
+| `--tier-disk-mirror` | Optional second NVMe ExpertStore root (read-only) |
+| `--tier-disk-weights a,b` | Primary/mirror bandwidth weights (or auto-probe) |
+| `--tier-numa` | Interleave pinned RAM via libnuma (also `VLLM_TIER_NUMA`) |
 | `--tier-policy quality\|balanced` | Live LFRU repin off/on |
 | `--tier-repin-tokens N` | Repin interval (balanced) |
 | `--tier-pilot` / `--tier-pilot-real` | Router-lookahead prefetch |
@@ -139,6 +142,22 @@ and **wait** (block immediately before the MoE GEMM); wait time goes to
 `h2d_stall_ns`. ExpertStore reads prefer aligned `O_DIRECT` windows; failures
 increment `disk_direct_fallback` and use buffered I/O. Demand I/O outranks
 PILOT prefetch in the disk worker queue.
+
+### Dual NVMe mirror
+
+`--tier-disk-mirror` points at a second ExpertStore root (same layer files).
+Routing is deterministic ``hash(layer, expert)`` skewed by
+`--tier-disk-weights` (or a startup probe). Partial mirrors are fine: missing
+or mismatched files stay on the primary. Mirror is read-only; usage heat maps
+and manifests live on the primary. Shutdown logs
+``MIRROR: served primary=… GiB mirror=… GiB``.
+
+### NUMA pinned arenas
+
+With `--tier-numa` / `VLLM_TIER_NUMA=1` on a multi-node Linux host that has
+``libnuma``, pinned expert frames are passed through
+``numa_interleave_memory`` after allocation. Unsupported hosts log once and
+keep default OS placement.
 
 ## Metrics
 

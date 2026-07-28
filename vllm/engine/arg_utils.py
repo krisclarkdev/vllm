@@ -527,6 +527,9 @@ class EngineArgs:
     tier_device_expert_gb: float = HierarchicalOffloadConfig.tier_device_expert_gb
     tier_ram_gb: float = HierarchicalOffloadConfig.tier_ram_gb
     tier_disk_path: str | None = HierarchicalOffloadConfig.tier_disk_path
+    tier_disk_mirror: str | None = HierarchicalOffloadConfig.tier_disk_mirror
+    tier_disk_weights: str | None = HierarchicalOffloadConfig.tier_disk_weights
+    tier_numa: bool = HierarchicalOffloadConfig.tier_numa
     tier_policy: str = HierarchicalOffloadConfig.tier_policy
     tier_repin_tokens: int = HierarchicalOffloadConfig.tier_repin_tokens
     tier_pilot: bool = HierarchicalOffloadConfig.tier_pilot
@@ -1266,6 +1269,13 @@ class EngineArgs:
         offload_group.add_argument(
             "--tier-disk-path", **hier_kwargs["tier_disk_path"]
         )
+        offload_group.add_argument(
+            "--tier-disk-mirror", **hier_kwargs["tier_disk_mirror"]
+        )
+        offload_group.add_argument(
+            "--tier-disk-weights", **hier_kwargs["tier_disk_weights"]
+        )
+        offload_group.add_argument("--tier-numa", **hier_kwargs["tier_numa"])
         offload_group.add_argument("--tier-policy", **hier_kwargs["tier_policy"])
         offload_group.add_argument(
             "--tier-repin-tokens", **hier_kwargs["tier_repin_tokens"]
@@ -2440,6 +2450,9 @@ class EngineArgs:
                 tier_device_expert_gb=self.tier_device_expert_gb,
                 tier_ram_gb=self.tier_ram_gb,
                 tier_disk_path=self.tier_disk_path,
+                tier_disk_mirror=self.tier_disk_mirror,
+                tier_disk_weights=self.tier_disk_weights,
+                tier_numa=self.tier_numa,
                 tier_policy=self.tier_policy,  # type: ignore[arg-type]
                 tier_repin_tokens=self.tier_repin_tokens,
                 tier_pilot=self.tier_pilot,

@@ -656,3 +656,141 @@ def test_pilot_gate_registration_and_prefetch(monkeypatch):
     snap = mgr.stats.snapshot()
     assert snap["pilot_predict_hits"] >= 1
     assert snap["pilot_predict_misses"] >= 1
+
+
+def test_volume_for_expert_stable_and_skewed():
+    from vllm.model_executor.offloader.hierarchical.mirror import (
+        parse_disk_weights,
+        volume_for_expert,
+    )
+
+    assert parse_disk_weights(None) == (1.0, 1.0)
+    assert parse_disk_weights("2,1") == (2.0, 1.0)
+    a = volume_for_expert(3, 7, 1.0, 1.0)
+    b = volume_for_expert(3, 7, 1.0, 1.0)
+    assert a == b
+    # Extreme skew → almost all primary.
+    primary_count = sum(
+        1 for e in range(200) if volume_for_expert(0, e, 100.0, 1.0) == 0
+    )
+    assert primary_count > 150
+    # Mirror-only weights.
+    assert all(volume_for_expert(0, e, 0.0, 1.0) == 1 for e in range(20))
+
+
+def test_validate_partial_mirror(tmp_path: Path):
+    from vllm.model_executor.offloader.hierarchical.mirror import (
+        validate_mirror_files,
+    )
+
+    primary = tmp_path / "primary"
+    mirror = tmp_path / "mirror"
+    primary.mkdir()
+    mirror.mkdir()
+    w13 = torch.randn(4, 4, 4)
+    w2 = torch.randn(4, 4, 4)
+    convert_layer_from_device_params(
+        primary, layer_id=0, weight_tensors=[w13, w2], model_id="t"
+    )
+    convert_layer_from_device_params(
+        primary, layer_id=1, weight_tensors=[w13, w2], model_id="t"
+    )
+    # Mirror only layer 0.
+    import shutil
+
+    shutil.copy2(primary / "L000.experts", mirror / "L000.experts")
+    ok = validate_mirror_files(primary, mirror)
+    assert "L000.experts" in ok
+    assert "L001.experts" not in ok
+
+
+def test_mirrored_reader_fallback(tmp_path: Path, monkeypatch):
+    from vllm.model_executor.offloader.hierarchical.disk_store import (
+        ExpertStoreReader,
+        MirroredExpertStoreReader,
+    )
+    from vllm.model_executor.offloader.hierarchical.mirror import (
+        volume_for_expert,
+    )
+
+    primary = tmp_path / "primary"
+    mirror = tmp_path / "mirror"
+    primary.mkdir()
+    mirror.mkdir()
+    w13 = torch.randn(8, 4, 4)
+    w2 = torch.randn(8, 4, 4)
+    convert_layer_from_device_params(
+        primary, layer_id=0, weight_tensors=[w13, w2], model_id="t"
+    )
+    import shutil
+
+    shutil.copy2(primary / "L000.experts", mirror / "L000.experts")
+    shutil.copy2(primary / "manifest.json", mirror / "manifest.json")
+
+    primary_r = ExpertStoreReader(str(primary), prefer_direct=False)
+    mirrored = MirroredExpertStoreReader(
+        primary_r,
+        mirror_path=str(mirror),
+        prefer_direct=False,
+        disk_weights="0,1",  # force mirror route when file mirrored
+    )
+    assert mirrored._mirror is not None
+
+    # Force mirror reads to fail → primary fallback.
+    def boom(*_a, **_k):
+        raise OSError("simulated mirror failure")
+
+    monkeypatch.setattr(mirrored._mirror, "read_rows_sync", boom)
+    rows = mirrored.read_rows_sync(0, [0, 1, 2])
+    assert set(rows) == {0, 1, 2}
+    assert mirrored._mirror_fallback_warned
+    # Primary still served bytes.
+    assert primary_r.bytes_served > 0
+    # Routing stable for demand vs "pilot".
+    assert volume_for_expert(0, 3, 0.0, 1.0) == mirrored.route_volume(0, 3)
+    mirrored.close()
+
+
+def test_mirrored_reader_bytes_on_both_volumes(tmp_path: Path):
+    from vllm.model_executor.offloader.hierarchical.disk_store import (
+        ExpertStoreReader,
+        MirroredExpertStoreReader,
+        ensure_store_or_none,
+    )
+
+    primary = tmp_path / "primary"
+    mirror = tmp_path / "mirror"
+    primary.mkdir()
+    mirror.mkdir()
+    w13 = torch.randn(16, 2, 2)
+    w2 = torch.randn(16, 2, 2)
+    convert_layer_from_device_params(
+        primary, layer_id=0, weight_tensors=[w13, w2], model_id="t"
+    )
+    import shutil
+
+    shutil.copy2(primary / "L000.experts", mirror / "L000.experts")
+
+    reader = ensure_store_or_none(
+        str(primary),
+        num_workers=2,
+        prefer_direct=False,
+        disk_mirror=str(mirror),
+        disk_weights="1,1",
+    )
+    assert isinstance(reader, MirroredExpertStoreReader)
+    ids = list(range(16))
+    rows = reader.read_rows_sync(0, ids)
+    assert len(rows) == 16
+    stats = reader.mirror_stats()
+    assert stats["primary_bytes"] > 0
+    assert stats["mirror_bytes"] > 0
+    reader.close()
+
+    # Single-disk unchanged.
+    solo = ensure_store_or_none(
+        str(primary), num_workers=1, prefer_direct=False
+    )
+    assert isinstance(solo, ExpertStoreReader)
+    assert solo.read_row_sync(0, 0).numel() > 0
+    solo.close()

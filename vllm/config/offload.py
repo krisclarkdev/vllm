@@ -98,6 +98,19 @@ class HierarchicalOffloadConfig:
     """Directory for the immutable ExpertStore. Required when experts exceed
     the RAM cache. ``None`` keeps all experts in pinned RAM (Phase-1 mode)."""
 
+    tier_disk_mirror: str | None = None
+    """Optional second ExpertStore root (read-only mirror on another NVMe).
+    Partial mirrors are OK; missing files stay on ``tier_disk_path``."""
+
+    tier_disk_weights: str | None = None
+    """Bandwidth weights ``primary,mirror`` (e.g. ``2,1``). When unset and a
+    mirror is configured, vLLM probes sequential read speed at startup."""
+
+    tier_numa: bool = False
+    """Interleave pinned expert RAM arenas across NUMA nodes via libnuma
+    ``numa_interleave_memory`` when available. Also honored via
+    ``VLLM_TIER_NUMA=1``. No-op with a log if unsupported."""
+
     tier_policy: TierPolicy = "quality"
     """``quality``: no live repin. ``balanced``: LFRU repin of hot experts."""
 
