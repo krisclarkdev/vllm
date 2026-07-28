@@ -27,6 +27,7 @@ from vllm.model_executor.offloader.hierarchical.metrics import (
     record_stats,
 )
 from vllm.model_executor.offloader.hierarchical.planner import (
+    DEFAULT_DEVICE_RESERVE_BYTES,
     build_tier_plan,
     log_tier_plan,
     resolve_ram_budget_bytes,
@@ -89,6 +90,7 @@ class LayerTierState:
         self.num_experts = host_weights[0].shape[0]
         # Optional global→local map captured before slot rebind.
         self.expert_map = expert_map
+        self.full_residency = slot_pool.num_slots >= self.num_experts > 0
 
     def to_local(self, expert_id: int) -> int:
         """Map a router expert id to a local host-pack index, or -1."""
@@ -117,6 +119,7 @@ class ExpertTierManager:
         self._usage: ExpertUsageStore | None = None
         self._pilot: PilotPrefetcher | None = None
         self._tokens_since_repin = 0
+        self._records_since_flush = 0
         self._initialized = False
         self._model_path = model_path
         self._pending_modules: list[tuple[int, nn.Module]] = []
@@ -124,6 +127,9 @@ class ExpertTierManager:
         # construct/load. Oldest are spilled to host only under VRAM pressure
         # so we use GPU+RAM together instead of host-only (which causes swap).
         self._device_resident_experts: list[nn.Module] = []
+        # OS-pinned host bytes used while parking during load (capped later).
+        self._pinned_host_bytes = 0
+        self._pinned_host_budget = resolve_ram_budget_bytes(config)
 
     def register_moe_module(self, layer_id: int, module: nn.Module) -> None:
         """Queue a RoutedExperts (or parent) module for post_init staging."""
@@ -147,19 +153,39 @@ class ExpertTierManager:
         return 3 * 1024**3
 
     def _park_module_to_host(self, module: nn.Module) -> int:
-        """Move one module's expert packs to pageable CPU. Returns #params moved."""
+        """Move one module's expert packs to host (pinned while budget remains).
+
+        Hot/early layers stay in OS-pinned frames up to
+        ``resolve_ram_budget_bytes``; overflow uses pageable CPU. Post-init
+        seeds the shared ``PinnedExpertRamCache`` from these host packs so
+        parks do not orphan accounting.
+        """
         params = dict(module.named_parameters(recurse=False))
         moved = 0
+        pack_nbytes = 0
         for name in _WEIGHT_PARAM_NAMES:
             if name not in params:
                 continue
             p = params[name]
             if p.device.type == "cpu":
                 continue
-            cpu = torch.empty_like(p, device="cpu", pin_memory=False)
+            pack_nbytes += p.numel() * p.element_size()
+        use_pin = (
+            pack_nbytes > 0
+            and self._pinned_host_bytes + pack_nbytes <= self._pinned_host_budget
+        )
+        for name in _WEIGHT_PARAM_NAMES:
+            if name not in params:
+                continue
+            p = params[name]
+            if p.device.type == "cpu":
+                continue
+            cpu = torch.empty_like(p, device="cpu", pin_memory=use_pin)
             cpu.copy_(p.detach())
             p.data = cpu
             moved += 1
+        if moved and use_pin:
+            self._pinned_host_bytes += pack_nbytes
         if hasattr(module, "w13_qweight"):
             module.w13_weight = module.w13_qweight
         if hasattr(module, "w2_qweight"):
@@ -228,19 +254,31 @@ class ExpertTierManager:
         )
         num_local = host_like[0].shape[0]
         top_k = getattr(sample_mod, "top_k", 8) or 8
+        free_dev, _total_dev = self._device_mem_bytes()
         plan = build_tier_plan(
             self.config,
             num_moe_layers=len(self._pending_modules),
             num_local_experts=num_local,
             expert_row_bytes=row_nbytes,
             top_k=int(top_k),
+            free_device_bytes=free_dev,
+            device_reserve_bytes=max(
+                self._load_vram_reserve_bytes(), DEFAULT_DEVICE_RESERVE_BYTES
+            ),
+            estimated_unique=max(int(top_k) * 2, int(top_k)),
         )
         log_tier_plan(plan)
         slots = plan.slots_per_layer
+        full_residency = plan.full_residency
 
-        # RAM cache sized to max row across layers (assume uniform).
+        # RAM cache: OS-pinned hot arena capped to budget; pageable overflow.
         ram_budget = resolve_ram_budget_bytes(self.config)
-        self._ram = PinnedExpertRamCache(ram_budget, row_nbytes)
+        self._pinned_host_budget = ram_budget
+        self._ram = PinnedExpertRamCache(
+            ram_budget,
+            row_nbytes,
+            pageable_capacity_bytes=max(ram_budget, row_nbytes * slots * 4),
+        )
 
         usage_path = self.config.tier_usage_path or default_usage_path(
             self.config.tier_disk_path, self._model_path
@@ -260,22 +298,27 @@ class ExpertTierManager:
             pnames, weights = self._extract_expert_params(module)
             if not weights:
                 continue
-            # Host copies of full expert packs. Reuse storage when params are
-            # already parked on CPU (avoid 2× RAM for large MoE).
+            # Host copies of full expert packs. Prefer OS-pinned while under
+            # the shared RAM budget; overflow stays pageable. Reuse CPU packs
+            # already parked during load (no 2× copy).
             host_weights: list[torch.Tensor] = []
-            pin = True
-            try:
-                sample_nbytes = sum(w.numel() * w.element_size() for w in weights)
-                pin = sample_nbytes <= 512 * 1024 * 1024
-            except Exception:
-                pin = False
+            sample_nbytes = sum(w.numel() * w.element_size() for w in weights)
+            already_cpu = all(w.device.type == "cpu" for w in weights)
+            pin_host = (
+                not already_cpu
+                and sample_nbytes > 0
+                and self._pinned_host_bytes + sample_nbytes
+                <= self._pinned_host_budget
+            )
             for w in weights:
                 if w.device.type == "cpu":
                     host_weights.append(w.detach())
                     continue
-                cpu = torch.empty_like(w, device="cpu", pin_memory=pin)
+                cpu = torch.empty_like(w, device="cpu", pin_memory=pin_host)
                 cpu.copy_(w.detach())
                 host_weights.append(cpu)
+            if pin_host:
+                self._pinned_host_bytes += sample_nbytes
 
             # Optionally spill to ExpertStore.
             if self.config.tier_disk_path and self._disk is None:
@@ -296,8 +339,9 @@ class ExpertTierManager:
                     prefer_direct=self.config.tier_direct,
                 )
 
-            # Seed RAM with hottest experts (or first slots-worth).
-            hot = self._usage.hottest(layer_id, slots * 4, host_weights[0].shape[0])
+            # Seed RAM (pinned hot) from usage heat + initial fill.
+            seed_n = host_weights[0].shape[0] if full_residency else slots * 4
+            hot = self._usage.hottest(layer_id, seed_n, host_weights[0].shape[0])
             for eid in hot:
                 if not self._ram.enabled:
                     break
@@ -337,14 +381,18 @@ class ExpertTierManager:
             )
 
             # Prefetch initial hot set into device slots (fill all slots so
-            # VRAM is front-loaded rather than left half-empty).
-            init_ids = list(hot[:slots])
-            if len(init_ids) < slots:
-                for eid in range(host_weights[0].shape[0]):
-                    if eid not in init_ids:
-                        init_ids.append(eid)
-                    if len(init_ids) >= slots:
-                        break
+            # VRAM is front-loaded rather than left half-empty). Full residency
+            # loads every local expert once (Colibri PIN_GB=all analogue).
+            if full_residency:
+                init_ids = list(range(host_weights[0].shape[0]))
+            else:
+                init_ids = list(hot[:slots])
+                if len(init_ids) < slots:
+                    for eid in range(host_weights[0].shape[0]):
+                        if eid not in init_ids:
+                            init_ids.append(eid)
+                        if len(init_ids) >= slots:
+                            break
             self._ensure_layer(layer_id, init_ids, record_usage=False)
 
         if self.config.tier_pilot:
@@ -544,7 +592,13 @@ class ExpertTierManager:
             current_platform.current_stream().wait_stream(self.copy_stream)
 
     def notify_tokens(self, n: int) -> None:
-        """Advance repin clock by ``n`` emitted tokens."""
+        """Advance repin clock by ``n`` emitted tokens; flush usage periodically."""
+        if n > 0 and self._usage is not None:
+            self._records_since_flush += n
+            flush_every = max(512, (self.config.tier_repin_tokens or 64) * 8)
+            if self._records_since_flush >= flush_every:
+                self._usage.flush()
+                self._records_since_flush = 0
         if self.config.tier_policy != "balanced":
             return
         if self.config.tier_repin_tokens <= 0:
@@ -577,9 +631,6 @@ class ExpertTierManager:
     ) -> dict[int, int]:
         state = self.layers[layer_id]
         pool = state.slot_pool
-        host_rows: dict[int, list[torch.Tensor]] = {}
-        needed = [e for e in expert_ids if e >= 0 and not pool.contains(e)]
-
         unique_pos = [e for e in set(expert_ids) if e >= 0]
         self.stats.ensure_calls += 1
         increment_prom(ensure_call=True)
@@ -588,6 +639,26 @@ class ExpertTierManager:
         self.stats.unique_experts_hist[n_unique] = (
             self.stats.unique_experts_hist.get(n_unique, 0) + 1
         )
+
+        # Full-residency fast path: all local experts already in slots —
+        # identity-style remap, no H2D / disk, still record PR-A metrics.
+        if state.full_residency and all(pool.contains(e) for e in unique_pos):
+            for eid in unique_pos:
+                self.stats.device_hits += 1
+                increment_prom("device", hit=True)
+            if record_usage and self._usage is not None:
+                self._usage.record(layer_id, expert_ids)
+            full: dict[int, int] = {}
+            for eid in expert_ids:
+                if eid < 0:
+                    continue
+                sid = pool.slot_of(eid)
+                if sid is not None:
+                    full[eid] = sid
+            return full
+
+        host_rows: dict[int, list[torch.Tensor]] = {}
+        needed = [e for e in expert_ids if e >= 0 and not pool.contains(e)]
 
         # Always materialize host rows for every requested expert up front.
         # Slot eviction within ensure_from_host_rows can invalidate earlier

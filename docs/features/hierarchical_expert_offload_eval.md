@@ -98,13 +98,42 @@ for full residency (less interesting for hit-rate metrics). Optional:
 `disk_*` stay 0 when no `--tier-disk-path` is configured. Compare mode adds
 `tok_s_warm_hierarchical`, `tok_s_warm_baseline`, `speedup_vs_baseline`.
 
-## Results (fill on hardware)
+## PR-B residency bakeoff (hal)
 
-| Setup | tok_s_warm | TTFT proxy | device hit rate | Notes |
-|-------|------------|------------|-----------------|-------|
-| baseline (no offload) | | | n/a | Mixtral-8x7B AWQ |
-| hierarchical slots=4 | | | | Mixtral-8x7B AWQ |
-| Colibri reference | | | | optional `--colibri-tok-s` |
+```bash
+# Full residency (slots=E=8) — should approach baseline tok/s
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 8 --tier-ram-gb 8 --warm 8 --max-tokens 64 \
+  --max-num-batched-tokens 64 --max-num-seqs 1 \
+  --output /tmp/hier_pr_b_residency.json
+
+# Forced staging (slots=4)
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 4 --tier-ram-gb 8 --warm 8 --max-tokens 64 \
+  --prompt Hi --max-num-batched-tokens 1 --max-num-seqs 1 \
+  --output /tmp/hier_pr_b_slots4.json
+```
+
+Acceptance (aspirational): with `slots=E`, warm hierarchical decode within
+~10% of baseline tok/s on the same hardware.
+
+### Hal / Arc Pro B70 results (2026-07-28)
+
+Model: Mixtral-8x7B-Instruct-v0.1-AWQ @ ~32 GiB XPU. Image tip
+`3deb3160c` (PR-B). Unit tests: 13/13.
+
+| Setup | tok_s_warm | device hit rate | Notes |
+|-------|------------|-----------------|-------|
+| baseline (no offload) | ~40.66 | n/a | `/tmp/hier_pr_b_baseline.json` |
+| hierarchical slots=8 | — | — | **XPU OOM** during profile / `XpuFusedMoe` init |
+| hierarchical slots=7..5 | — | — | OOM (slot sweep) |
+| hierarchical slots=4 | ~0.72 | ~0.994 | `/tmp/hier_pr_b_slots4.json`; staging thrash |
+
+Full-residency tok/s parity is **not** claimed on this GPU/model. Treat
+**slots=4** as the accepted bakeoff / PR-C comparison baseline (same config
+with vs without async+pilot). Revisit slots=`E` on a smaller model, lower
+profile util, or after memory wins.
 
 AI assistance was used for this feature implementation.
-"""

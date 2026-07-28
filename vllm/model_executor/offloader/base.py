@@ -84,6 +84,14 @@ class BaseOffloader(ABC):
         """Join streams after forward. Override in subclasses."""
         pass
 
+    def notify_tokens(self, n: int) -> None:  # noqa: B027
+        """Notify that ``n`` tokens were scheduled/emitted (learned pins)."""
+        pass
+
+    def shutdown(self) -> None:  # noqa: B027
+        """Release offloader resources. Override in subclasses."""
+        pass
+
     def _wait_for_layer(self, layer_idx: int) -> None:  # noqa: B027
         """Wait for layer prefetch. Override in subclasses."""
         pass

@@ -174,6 +174,9 @@ class HierarchicalOffloader(BaseOffloader):
         if self._dense_prefetch is not None:
             self._dense_prefetch.join_after_forward()
 
+    def notify_tokens(self, n: int) -> None:
+        self.manager.notify_tokens(n)
+
     def shutdown(self) -> None:
         self.manager.shutdown()
         set_tier_manager(None)
