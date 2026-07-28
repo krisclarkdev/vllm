@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -12,25 +12,54 @@ class TierStats:
     """In-process counters for hierarchical staging."""
 
     device_hits: int = 0
+    device_misses: int = 0
     ram_hits: int = 0
+    ram_misses: int = 0
     disk_hits: int = 0
-    dma_bytes: int = 0
-    stall_ns: int = 0
-    unique_experts: int = 0
-    ensures: int = 0
+    disk_misses: int = 0
+    h2d_bytes: int = 0
+    h2d_stall_ns: int = 0
+    disk_bytes: int = 0
+    disk_wait_ns: int = 0
+    unique_experts_sum: int = 0
+    ensure_calls: int = 0
+    # Optional coarse histogram: unique-expert count → occurrences.
+    unique_experts_hist: dict[int, int] = field(default_factory=dict)
 
-    def snapshot(self) -> dict[str, int | float]:
-        total = self.device_hits + self.ram_hits + self.disk_hits
+    def snapshot(self) -> dict[str, int | float | dict[str, int]]:
+        device_lookups = self.device_hits + self.device_misses
+        ram_lookups = self.ram_hits + self.ram_misses
+        disk_lookups = self.disk_hits + self.disk_misses
         return {
             "device_hits": self.device_hits,
+            "device_misses": self.device_misses,
             "ram_hits": self.ram_hits,
+            "ram_misses": self.ram_misses,
             "disk_hits": self.disk_hits,
-            "dma_bytes": self.dma_bytes,
-            "stall_ms": self.stall_ns / 1e6,
-            "unique_experts": self.unique_experts,
-            "ensures": self.ensures,
-            "device_hit_rate": self.device_hits / max(1, total),
+            "disk_misses": self.disk_misses,
+            "h2d_bytes": self.h2d_bytes,
+            "h2d_stall_ns": self.h2d_stall_ns,
+            "h2d_stall_ms": self.h2d_stall_ns / 1e6,
+            "disk_bytes": self.disk_bytes,
+            "disk_wait_ns": self.disk_wait_ns,
+            "disk_wait_ms": self.disk_wait_ns / 1e6,
+            "unique_experts_sum": self.unique_experts_sum,
+            "unique_experts_hist": {
+                str(k): v for k, v in sorted(self.unique_experts_hist.items())
+            },
+            "ensure_calls": self.ensure_calls,
+            "device_hit_rate": self.device_hits / max(1, device_lookups),
+            "ram_hit_rate": self.ram_hits / max(1, ram_lookups),
+            "disk_hit_rate": self.disk_hits / max(1, disk_lookups),
         }
+
+    def reset(self) -> None:
+        """Zero all counters (e.g. between bakeoff warm and measure)."""
+        for f in asdict(self):
+            if f == "unique_experts_hist":
+                self.unique_experts_hist.clear()
+            else:
+                setattr(self, f, 0)
 
 
 _PROM_REGISTERED = False
@@ -49,13 +78,30 @@ def _ensure_prometheus() -> None:
             "Hierarchical expert staging hits by tier",
             ["tier"],
         )
-        _prom_counters["dma_bytes"] = Counter(
-            "vllm_tier_expert_dma_bytes_total",
+        _prom_counters["misses"] = Counter(
+            "vllm_tier_expert_misses_total",
+            "Hierarchical expert staging misses by tier",
+            ["tier"],
+        )
+        _prom_counters["h2d_bytes"] = Counter(
+            "vllm_tier_expert_h2d_bytes_total",
             "Bytes DMA'd into device expert slots",
         )
-        _prom_counters["stall_seconds"] = Counter(
-            "vllm_tier_expert_stall_seconds_total",
-            "Seconds stalled waiting for expert DMA",
+        _prom_counters["h2d_stall_seconds"] = Counter(
+            "vllm_tier_expert_h2d_stall_seconds_total",
+            "Seconds stalled waiting for expert H2D DMA",
+        )
+        _prom_counters["disk_bytes"] = Counter(
+            "vllm_tier_expert_disk_bytes_total",
+            "Bytes read from ExpertStore disk tier",
+        )
+        _prom_counters["disk_wait_seconds"] = Counter(
+            "vllm_tier_expert_disk_wait_seconds_total",
+            "Seconds waiting on ExpertStore disk reads",
+        )
+        _prom_counters["ensure_calls"] = Counter(
+            "vllm_tier_expert_ensure_calls_total",
+            "Calls to hierarchical ensure_layer",
         )
         _prom_counters["hit_rate"] = Gauge(
             "vllm_tier_expert_device_hit_rate",
@@ -78,22 +124,48 @@ def record_stats(stats: TierStats) -> None:
             pass
 
 
-def increment_prom(tier: str, *, dma_bytes: int = 0, stall_ns: int = 0) -> None:
-    """Increment prometheus counters for a single ensure event."""
+def increment_prom(
+    tier: str | None = None,
+    *,
+    hit: bool | None = None,
+    h2d_bytes: int = 0,
+    h2d_stall_ns: int = 0,
+    disk_bytes: int = 0,
+    disk_wait_ns: int = 0,
+    ensure_call: bool = False,
+) -> None:
+    """Increment prometheus counters for a staging event."""
     _ensure_prometheus()
-    hits = _prom_counters.get("hits")
-    if hits is not None:
+    if tier is not None and hit is not None:
+        key = "hits" if hit else "misses"
+        counter = _prom_counters.get(key)
+        if counter is not None:
+            try:
+                counter.labels(tier=tier).inc()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    if h2d_bytes and (c := _prom_counters.get("h2d_bytes")) is not None:
         try:
-            hits.labels(tier=tier).inc()  # type: ignore[attr-defined]
+            c.inc(h2d_bytes)  # type: ignore[attr-defined]
         except Exception:
             pass
-    if dma_bytes and (c := _prom_counters.get("dma_bytes")) is not None:
+    if h2d_stall_ns and (c := _prom_counters.get("h2d_stall_seconds")) is not None:
         try:
-            c.inc(dma_bytes)  # type: ignore[attr-defined]
+            c.inc(h2d_stall_ns / 1e9)  # type: ignore[attr-defined]
         except Exception:
             pass
-    if stall_ns and (c := _prom_counters.get("stall_seconds")) is not None:
+    if disk_bytes and (c := _prom_counters.get("disk_bytes")) is not None:
         try:
-            c.inc(stall_ns / 1e9)  # type: ignore[attr-defined]
+            c.inc(disk_bytes)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if disk_wait_ns and (c := _prom_counters.get("disk_wait_seconds")) is not None:
+        try:
+            c.inc(disk_wait_ns / 1e9)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if ensure_call and (c := _prom_counters.get("ensure_calls")) is not None:
+        try:
+            c.inc()  # type: ignore[attr-defined]
         except Exception:
             pass
