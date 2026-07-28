@@ -70,29 +70,65 @@ At startup vLLM logs a **tier plan** similar to Colibri’s `coli plan`:
 Hierarchical expert tier plan:
   policy=quality
   moe_layers=... local_experts=... slots/layer=...
+  full_residency=yes|no
+  batch_union_floor=...
   device_slots=... GiB
   ram_cache=... GiB
   disk_backing=... GiB
   predicted_bottleneck=pcie_or_ram_hits|nvme|none_full_residency
 ```
 
+### Auto slot sizing
+
+- `--tier-num-slots N` (N>0): honor and clamp to local expert count `E`.
+- `--tier-num-slots 0` (default): derive from `--tier-device-expert-gb`, else
+  from **free device memory** after a dense+KV reserve (~6 GiB).
+- Slots are raised to a **batch-union floor**
+  `min(E, max(top_k, estimated_unique))` so Mixtral-class workloads do not
+  thrash at an accidentally tiny slot count.
+
+### Full residency (`PIN_GB=all` analogue)
+
+When `slots >= E` (`full_residency=yes`), hierarchical staging keeps every
+local expert in the device slot pool after init and uses a **fast path**:
+identity-style remap with no H2D/disk churn per forward (PR-A metrics still
+recorded as device hits). This is the Colibri-like `PIN_GB=all` analogue.
+
+```bash
+# Mixtral-8x7B: 8 experts → full residency
+vllm serve ... --offload-backend hierarchical --tier-num-slots 8
+```
+
+Forced staging for bakeoffs: `--tier-num-slots 4` (of 8).
+
+
 Reservation order: dense resident → KV cache → activation scratch → expert
 slots. Hierarchical weight offload **cannot** be combined with UVA
 `--cpu-offload-gb`. It may coexist with KV CPU offload; leave headroom in
 `--tier-ram-gb` for the KV tier.
 
+### Pinned hot vs pageable cold
+
+`--tier-ram-gb` caps the **OS-pinned** hot arena (`resolve_ram_budget_bytes`).
+Hot experts (usage heat + initial fill) live in pinned frames for fast H2D;
+overflow uses a **pageable** arena. Load-time VRAM parks respect the same
+pinned budget instead of blindly using `pin_memory=False`.
+
 ## How it works
 
-1. After weight load, full expert packs move to pinned host (and optionally
-   ExpertStore on NVMe in post-XPU runtime layout).
+1. After weight load, full expert packs move to host (pinned while under the
+   RAM budget; pageable overflow) and optionally ExpertStore on NVMe.
 2. Each MoE layer gets a fixed **device slot pool** of `E_slots` experts.
    `XpuFusedMoe` / modular kernels see a dense pack of size `E_slots`.
 3. On every forward, after `select_experts`, the tier manager **batch-unions**
    unique expert ids, ensures they are in slots (RAM hit → DMA, disk miss →
    O_DIRECT/io thread → DMA), and **remaps** `topk_ids` to slot indices.
+   Full residency skips ensure churn after the initial fill.
 4. Optional **PILOT** prefetches the next layer’s experts from a routing hint.
-5. **Learned pins** (`.vllm_expert_usage`) keep hot experts in RAM across runs;
-   `balanced` policy does live LFRU repin.
+5. **Learned pins** (`.vllm_expert_usage`) seed device slots + pinned RAM at
+   `post_init`; with `--tier-policy balanced`, `notify_tokens` from the worker
+   triggers live LFRU `repin_hottest` every `--tier-repin-tokens`. Usage is
+   flushed periodically and on shutdown.
 
 ## Metrics
 

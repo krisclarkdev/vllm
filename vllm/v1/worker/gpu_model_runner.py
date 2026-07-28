@@ -4447,6 +4447,9 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        # Learned hierarchical pins: advance heat / periodic usage flush.
+        get_offloader().notify_tokens(num_scheduled_tokens)
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -6533,6 +6536,10 @@ class GPUModelRunner(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        try:
+            get_offloader().shutdown()
+        except Exception:
+            pass
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.

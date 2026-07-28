@@ -21,6 +21,7 @@ from vllm.model_executor.offloader.hierarchical.format import (
     unpack_expert_row,
 )
 from vllm.model_executor.offloader.hierarchical.planner import (
+    batch_union_floor,
     build_tier_plan,
     compute_slots_per_layer,
     resolve_ram_budget_bytes,
@@ -71,7 +72,82 @@ def test_planner_slots_and_ram():
         top_k=8,
     )
     assert plan.slots_per_layer == 16
+    assert plan.full_residency is False
     assert "Hierarchical expert tier plan" in plan.summary()
+    assert "full_residency=no" in plan.summary()
+
+
+def test_planner_auto_slots_clamp_and_floor():
+    # Explicit slots clamp to E.
+    cfg = HierarchicalOffloadConfig(tier_num_slots=128)
+    assert (
+        compute_slots_per_layer(
+            cfg, num_moe_layers=2, num_local_experts=8, expert_row_bytes=1024
+        )
+        == 8
+    )
+    # Auto from device GB budget.
+    cfg = HierarchicalOffloadConfig(tier_num_slots=0, tier_device_expert_gb=1.0)
+    # 1 GiB / 2 layers / 64 MiB row → 8 slots before floor; floor may raise.
+    row = 64 * 1024 * 1024
+    slots = compute_slots_per_layer(
+        cfg,
+        num_moe_layers=2,
+        num_local_experts=64,
+        expert_row_bytes=row,
+        top_k=8,
+        estimated_unique=16,
+    )
+    assert slots >= batch_union_floor(
+        num_local_experts=64, top_k=8, estimated_unique=16
+    )
+    assert slots <= 64
+    # Free-device auto path.
+    cfg = HierarchicalOffloadConfig(tier_num_slots=0, tier_device_expert_gb=0)
+    slots_free = compute_slots_per_layer(
+        cfg,
+        num_moe_layers=4,
+        num_local_experts=8,
+        expert_row_bytes=1024 * 1024,
+        top_k=2,
+        free_device_bytes=20 * 1024**3,
+        device_reserve_bytes=6 * 1024**3,
+        estimated_unique=4,
+    )
+    assert slots_free == 8  # full residency fits
+    plan = build_tier_plan(
+        cfg,
+        num_moe_layers=4,
+        num_local_experts=8,
+        expert_row_bytes=1024 * 1024,
+        top_k=2,
+        free_device_bytes=20 * 1024**3,
+        estimated_unique=4,
+    )
+    assert plan.full_residency is True
+    assert "full_residency=yes" in plan.summary()
+
+
+def test_ram_cache_pinned_budget_overflow():
+    """Soft-pinned hot rows stay in the pinned arena; overflow is pageable."""
+    row = torch.arange(64, dtype=torch.uint8)
+    cache = PinnedExpertRamCache(
+        capacity_bytes=64 * 2,  # 2 pinned frames
+        row_nbytes=64,
+        pageable_capacity_bytes=64 * 4,
+    )
+    cache.put(0, 0, row, pinned=True)
+    cache.put(0, 1, row + 1, pinned=True)
+    # Additional hot puts spill to pageable when pinned soft-pins fill arena.
+    cache.put(0, 2, row + 2, pinned=True)
+    assert cache.get(0, 0) is not None
+    assert cache.get(0, 1) is not None
+    assert cache.get(0, 2) is not None
+    assert cache.pinned_bytes_used <= cache.pinned_capacity_bytes
+    # Cold (unpinned) rows land in pageable without evicting soft pins.
+    cache.put(0, 3, row + 3, pinned=False)
+    assert cache.get(0, 0) is not None
+    assert cache.get(0, 3) is not None
 
 
 def test_usage_store_roundtrip(tmp_path: Path):
@@ -94,10 +170,9 @@ def test_ram_cache_put_get_evict():
     got = cache.get(0, 0)
     assert got is not None
     assert torch.equal(got, row)
-    # Force eviction of non-pinned
+    # Force eviction of non-pinned (pageable) occupants
     cache.put(0, 2, row + 2)
-    # expert 1 may be evicted
-    assert cache.get(0, 0) is not None  # pinned survives
+    assert cache.get(0, 0) is not None  # soft-pinned survives
 
 
 def test_expert_store_format(tmp_path: Path):

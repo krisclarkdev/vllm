@@ -98,13 +98,34 @@ for full residency (less interesting for hit-rate metrics). Optional:
 `disk_*` stay 0 when no `--tier-disk-path` is configured. Compare mode adds
 `tok_s_warm_hierarchical`, `tok_s_warm_baseline`, `speedup_vs_baseline`.
 
+## PR-B residency bakeoff (hal)
+
+```bash
+# Full residency (slots=E=8) — should approach baseline tok/s
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 8 --tier-ram-gb 8 --warm 8 --max-tokens 64 \
+  --max-num-batched-tokens 64 --max-num-seqs 1 \
+  --output /tmp/hier_pr_b_residency.json
+
+# Forced staging (slots=4)
+.venv/bin/python benchmarks/hierarchical_tier_bakeoff.py \
+  --model /tank/nas/models/Mixtral-8x7B-Instruct-v0.1-AWQ \
+  --tier-num-slots 4 --tier-ram-gb 8 --warm 8 --max-tokens 64 \
+  --prompt Hi --max-num-batched-tokens 1 --max-num-seqs 1 \
+  --output /tmp/hier_pr_b_slots4.json
+```
+
+Acceptance: with `slots=E`, warm hierarchical decode within ~10% of baseline
+tok/s on the same hardware (metrics-only claims for slots=4).
+
 ## Results (fill on hardware)
 
 | Setup | tok_s_warm | TTFT proxy | device hit rate | Notes |
 |-------|------------|------------|-----------------|-------|
 | baseline (no offload) | | | n/a | Mixtral-8x7B AWQ |
-| hierarchical slots=4 | | | | Mixtral-8x7B AWQ |
+| hierarchical slots=8 (full residency) | | | | PR-B |
+| hierarchical slots=4 | | | | PR-B staging |
 | Colibri reference | | | | optional `--colibri-tok-s` |
 
 AI assistance was used for this feature implementation.
-"""
