@@ -28,6 +28,7 @@ class TierStats:
     pilot_predict_misses: int = 0
     disk_bytes_primary: int = 0
     disk_bytes_mirror: int = 0
+    host_expert_id_syncs: int = 0
     # Optional coarse histogram: unique-expert count → occurrences.
     unique_experts_hist: dict[int, int] = field(default_factory=dict)
 
@@ -61,6 +62,7 @@ class TierStats:
             / max(1, pilot_lookups),
             "disk_bytes_primary": self.disk_bytes_primary,
             "disk_bytes_mirror": self.disk_bytes_mirror,
+            "host_expert_id_syncs": self.host_expert_id_syncs,
             "device_hit_rate": self.device_hits / max(1, device_lookups),
             "ram_hit_rate": self.ram_hits / max(1, ram_lookups),
             "disk_hit_rate": self.disk_hits / max(1, disk_lookups),

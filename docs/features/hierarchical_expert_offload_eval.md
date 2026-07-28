@@ -184,4 +184,17 @@ Acceptance: dual-path reads show non-zero `disk_bytes_primary` and
 `disk_bytes_mirror` (or `MIRROR:` log); single-disk path unchanged when mirror
 is unset. Unit tests cover hash stability, partial mirror, and mirror fallback.
 
+## PR-E device pipeline + graphs
+
+Audit (Mixtral hierarchical + XPU MoE):
+
+- Activations stay on-device through ensure→GEMM.
+- `wait_ensure` joins weight H2D events only.
+- Unavoidable host sync: expert-id `unique→tolist` (`host_expert_id_syncs`).
+- EP `expert_map` lookups cached on CPU at `post_init` (no per-forward `.item()`).
+- Slot `data_ptr` stability asserted after repeated `ensure_from_host_rows`.
+
+Graph matrix: default eager; `--tier-allow-cuda-graphs` allows piecewise /
+attention experiments only — full MoE+remap capture is not claimed.
+
 AI assistance was used for this feature implementation.

@@ -29,7 +29,10 @@ def maybe_wait_ensure(
     pending: PendingEnsure | None,
     topk_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Block until scheduled staging is ready; attribute ``h2d_stall_ns``."""
+    """Block until scheduled staging is ready; attribute ``h2d_stall_ns``.
+
+    Waits only on weight H2D events — activations are never synchronized here.
+    """
     if pending is None:
         return topk_ids
     mgr = get_tier_manager()
@@ -41,15 +44,27 @@ def maybe_wait_ensure(
 def maybe_pilot_after_ensure(
     layer_id: int,
     hidden_states: torch.Tensor | None,
-    topk_ids: torch.Tensor,
+    topk_ids: torch.Tensor | None = None,
+    *,
+    pending: PendingEnsure | None = None,
 ) -> None:
-    """Fire PILOT prefetch so next-layer DMA can overlap this layer's GEMM."""
+    """Fire PILOT so next-layer DMA can overlap this layer's GEMM.
+
+    Prefer ``pending.local_ids`` (already on host from schedule) over a fresh
+    ``unique→tolist`` of ``topk_ids``.
+    """
     if hidden_states is None:
         return
     mgr = get_tier_manager()
     if mgr is None or not mgr._initialized:
         return
-    mgr.maybe_pilot_prefetch(layer_id, hidden_states, topk_ids)
+    local_ids = pending.local_ids if pending is not None else None
+    mgr.maybe_pilot_prefetch(
+        layer_id,
+        hidden_states,
+        topk_ids,
+        local_expert_ids=local_ids,
+    )
 
 
 def maybe_ensure_and_remap(
@@ -57,15 +72,12 @@ def maybe_ensure_and_remap(
     topk_ids: torch.Tensor,
     hidden_states: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Schedule + wait ensure; optionally fire PILOT after weights are ready.
-
-    Prefer splitting ``maybe_schedule_ensure`` / ``maybe_wait_ensure`` around
-    other work when available. PILOT runs after wait so its DMA can overlap
-    the current layer's expert GEMM.
-    """
+    """Schedule + wait ensure; optionally fire PILOT after weights are ready."""
     pending = maybe_schedule_ensure(layer_id, topk_ids)
     remapped = maybe_wait_ensure(pending, topk_ids)
-    maybe_pilot_after_ensure(layer_id, hidden_states, topk_ids)
+    maybe_pilot_after_ensure(
+        layer_id, hidden_states, topk_ids, pending=pending
+    )
     return remapped
 
 

@@ -146,8 +146,14 @@ class HierarchicalOffloadConfig:
     ``tier_device_expert_gb`` and expert row size."""
 
     tier_allow_cuda_graphs: bool = False
-    """Experimental: allow XPU/CUDA graph capture with hierarchical staging.
-    Default False (eager) because external copy-stream events are hazardous."""
+    """Opt-in experimental graphs with hierarchical staging.
+
+    Default False forces ``enforce_eager``. When True, only piecewise /
+    attention graphs are considered supported; MoE stays eager with
+    overlapped H2D (slot buffers are address-stable, but dynamic remaps
+    are not safe inside a captured MoE region). See the hierarchical
+    expert offload docs for the support matrix.
+    """
 
     def is_active(self) -> bool:
         """Return True when hierarchical fields request activation."""

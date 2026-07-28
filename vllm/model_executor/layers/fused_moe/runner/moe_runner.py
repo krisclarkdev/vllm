@@ -598,11 +598,10 @@ class MoERunner(MoERunnerInterface):
                 maybe_wait_ensure,
             )
 
-            original_topk = topk_ids
             pending = maybe_schedule_ensure(self.layer_id, topk_ids)
             topk_ids = maybe_wait_ensure(pending, topk_ids)
             maybe_pilot_after_ensure(
-                self.layer_id, hidden_states, original_topk
+                self.layer_id, hidden_states, pending=pending
             )
 
             fused_out = self.routed_experts.forward_modular(

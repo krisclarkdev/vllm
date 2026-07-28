@@ -103,18 +103,24 @@ class LayerTierState:
         self.slot_pool = slot_pool
         self.row_nbytes = row_nbytes
         self.num_experts = host_weights[0].shape[0]
-        # Optional global→local map captured before slot rebind.
+        # Optional global→local map captured before slot rebind (CPU list for
+        # hot-path lookups — avoids per-forward .item() syncs).
         self.expert_map = expert_map
+        self._expert_map_cpu: list[int] | None = None
+        if expert_map is not None:
+            self._expert_map_cpu = [
+                int(x) for x in expert_map.detach().reshape(-1).cpu().tolist()
+            ]
         self.full_residency = slot_pool.num_slots >= self.num_experts > 0
 
     def to_local(self, expert_id: int) -> int:
         """Map a router expert id to a local host-pack index, or -1."""
         if expert_id < 0:
             return -1
-        if self.expert_map is not None:
-            if expert_id >= self.expert_map.numel():
+        if self._expert_map_cpu is not None:
+            if expert_id >= len(self._expert_map_cpu):
                 return -1
-            local = int(self.expert_map[expert_id].item())
+            local = self._expert_map_cpu[expert_id]
             return local if local >= 0 else -1
         if expert_id >= self.num_experts:
             return -1
@@ -141,6 +147,7 @@ class ExpertTierManager:
         # MoE gates registered before/after pilot construction.
         self._pending_gates: list[tuple[int, nn.Module]] = []
         self._disk_fallback_seen = 0
+        self._logged_host_id_sync = False
         # MoE expert modules still holding full packs on device during
         # construct/load. Oldest are spilled to host only under VRAM pressure
         # so we use GPU+RAM together instead of host-only (which causes swap).
@@ -592,6 +599,10 @@ class ExpertTierManager:
             return PendingEnsure(layer_id=layer_id, remapped_topk=topk_ids)
 
         state = self.layers[layer_id]
+        # Activations stay on-device; only expert *ids* must hit the host for
+        # slot allocation / RAM / disk lookup. That D2H is unavoidable today
+        # and is counted as host_expert_id_syncs (log-once).
+        self._note_host_expert_id_sync()
         flat = topk_ids.reshape(-1)
         unique = torch.unique(flat).tolist()
         global_to_local: dict[int, int] = {}
@@ -664,15 +675,37 @@ class ExpertTierManager:
 
         return pending.remapped_topk
 
+    def _note_host_expert_id_sync(self) -> None:
+        """Record an unavoidable D2H of expert ids on the ensure path."""
+        self.stats.host_expert_id_syncs += 1
+        if not self._logged_host_id_sync:
+            self._logged_host_id_sync = True
+            logger.info_once(
+                "Hierarchical ensure materializes unique expert ids on the "
+                "host (torch.unique→tolist) for slot/RAM/disk staging; "
+                "activations stay on-device. wait_ensure only joins weight "
+                "H2D events on the copy stream."
+            )
+
     def maybe_pilot_prefetch(
         self,
         layer_id: int,
         hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_ids: torch.Tensor | None = None,
+        *,
+        local_expert_ids: list[int] | None = None,
     ) -> None:
         if self._pilot is None:
             return
-        ids = [int(x) for x in torch.unique(topk_ids).tolist() if int(x) >= 0]
+        if local_expert_ids is not None:
+            ids = [int(x) for x in local_expert_ids if int(x) >= 0]
+        elif topk_ids is not None:
+            # Prefer callers that pass local_expert_ids from PendingEnsure to
+            # avoid a second unique→tolist sync before GEMM.
+            self._note_host_expert_id_sync()
+            ids = [int(x) for x in torch.unique(topk_ids).tolist() if int(x) >= 0]
+        else:
+            return
         self._pilot.prefetch_next(layer_id, hidden_states, ids)
 
     def prefetch_experts(
