@@ -155,12 +155,19 @@ profile util, or after memory wins.
 ```
 
 Acceptance: warm decode shows lower `h2d_stall_ns` and/or higher
-`device_hit_rate` vs the no-pilot control (same slots). Fill results after
-hal run.
+`device_hit_rate` vs the no-pilot control (same slots).
+
+### Hal results (2026-07-28)
+
+Affinity `--tier-pilot` (no `--tier-pilot-real`) on slots=4 **regressed**
+vs control: extra ensure/DMA thrash (ensure 4536 vs 2304; h2d_bytes ~18×).
+Pilot predict hit rate ~0.64 was not enough to offset critical-path prefetch
+cost. Prefer gate-real pilot and/or RAM-only / free-slot prefetch before
+claiming a win.
 
 | Setup | tok_s_warm | h2d_stall_ms | device hit rate | Notes |
 |-------|------------|--------------|-----------------|-------|
-| slots=4 no pilot | | | | `/tmp/hier_pr_c_nopilot.json` |
-| slots=4 + pilot | | | | `/tmp/hier_pr_c_pilot.json` |
+| slots=4 no pilot | ~1.09 | ~104 | ~0.990 | `/tmp/hier_pr_c_nopilot.json` |
+| slots=4 + pilot | ~0.51 | ~114 | ~0.828 | `/tmp/hier_pr_c_pilot.json`; predict hit ~0.64 |
 
 AI assistance was used for this feature implementation.
