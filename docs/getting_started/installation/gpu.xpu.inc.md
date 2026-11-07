@@ -51,7 +51,42 @@ There is no extra information on creating a new Python environment for this devi
 --8<-- [end:set-up-using-python]
 --8<-- [start:pre-built-wheels]
 
-Currently, there are no pre-built XPU wheels.
+Pre-built vLLM XPU wheels are published to `wheels.vllm.ai`. Each XPU wheel
+index also contains the `triton==3.7.2+xpu` shim described below. PyTorch XPU
+packages are served from the PyTorch XPU index, so both index URLs are needed.
+
+#### Install the latest code
+
+To install the wheel built from the latest main branch:
+
+```bash
+uv pip install vllm --extra-index-url https://wheels.vllm.ai/nightly/xpu --extra-index-url https://download.pytorch.org/whl/xpu --index-strategy unsafe-best-match
+```
+
+Note that after upgrading to PyTorch 2.14, xpu graph support requires specific oneAPI packages.
+
+```bash
+uv pip install \
+       "intel-cmplr-lib-rt==2026.1.1" \
+       "intel-cmplr-lib-ur==2026.1.1" \
+       "intel-cmplr-lic-rt==2026.1.1" \
+       "intel-sycl-rt==2026.1.1" \
+       "oneccl-devel==2022.1.2; platform_system == 'Linux' and platform_machine == 'x86_64'" \
+       "oneccl==2022.1.2; platform_system == 'Linux' and platform_machine == 'x86_64'" \
+       "dpcpp-cpp-rt==2026.1.1" \
+       "intel-opencl-rt==2026.1.1" \
+       "intel-openmp==2026.1.1" \
+       "intel-pti==1.1.0"
+```
+
+#### Install specific revisions
+
+If you want to access the wheels for previous commits (e.g. to bisect the behavior change, performance regression), you can specify the commit hash in the URL:
+
+```bash
+export VLLM_COMMIT=730bd35378bf2a5b56b6d3a45be28b3092d26519 # use full commit hash from the main branch
+uv pip install vllm --extra-index-url https://wheels.vllm.ai/${VLLM_COMMIT}/xpu --extra-index-url https://download.pytorch.org/whl/xpu --index-strategy unsafe-best-match
+```
 
 --8<-- [end:pre-built-wheels]
 --8<-- [start:build-wheel-from-source]
@@ -85,6 +120,18 @@ pip install -v -r requirements/xpu.txt
 ```bash
 VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e . -v
 ```
+
+!!! note
+    `requirements/xpu.txt` pins `triton==3.7.2+xpu`, a compatibility shim
+    hosted on `https://wheels.vllm.ai/xpu` that transparently resolves to
+    the real Intel XPU implementation (`triton-xpu`). This exists because
+    some transitive dependencies (e.g. `xgrammar`) unconditionally
+    require a distribution literally named `triton`, which otherwise
+    resolves to the NVIDIA-only PyPI `triton` package on XPU and can
+    cause correctness or runtime issues. No manual uninstall/reinstall of
+    `triton`/`triton-xpu` is needed; both `pip install` and `uv pip
+    install --index-strategy unsafe-best-match` resolve the correct
+    package automatically.
 
 --8<-- [end:build-wheel-from-source]
 --8<-- [start:pre-built-images]

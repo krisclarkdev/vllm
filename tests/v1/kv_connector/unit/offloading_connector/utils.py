@@ -37,6 +37,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -57,6 +58,7 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -65,7 +67,7 @@ def to_key(int_hash: int) -> OffloadKey:
     return make_offload_key(str(int_hash).encode(), 0)
 
 
-def to_keys(int_hashes: list[int]) -> list[OffloadKey]:
+def to_keys(int_hashes: Iterable[int]) -> list[OffloadKey]:
     return [to_key(i) for i in int_hashes]
 
 
@@ -92,14 +94,18 @@ class MockOffloadingWorker(OffloadingWorker):
 
     def submit_store(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
-    ) -> bool:  # type: ignore[override]
+    ) -> bool:
         self.transfer_specs[job_id] = (src_spec, dst_spec)
         self.waiting_jobs.add(job_id)
         return True
 
     def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
-    ) -> bool:  # type: ignore[override]
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+        expedited: bool = False,
+    ) -> bool:
         self.transfer_specs[job_id] = (src_spec, dst_spec)
         self.waiting_jobs.add(job_id)
         return True
@@ -129,7 +135,9 @@ class MockOffloadingSpec(OffloadingSpec):
         self.manager = MagicMock(spec=OffloadingManager)
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
+        self.manager.get_load_source.return_value = CacheHitSource.EXTERNAL_UNSPECIFIED
         self.manager.get_stats.return_value = None
+        self.manager.config_info.return_value = [{}]
         self.manager.on_new_request.return_value = RequestOffloadingContext()
         self.handler = MockOffloadingWorker()
 
@@ -179,11 +187,14 @@ class RequestRunner:
         async_scheduling: bool = True,
         kv_cache_groups: list[KVCacheGroupSpec] | None = None,
         extra_config_overrides: dict[str, Any] | None = None,
+        worker_count: int = 1,
+        retention_interval: int | None = None,
+        speculative_config: Any | None = None,
     ):
-        assert blocks_per_chunk == 1 or kv_cache_groups is None, (
-            "blocks_per_chunk > 1 requires all groups to have the same "
-            "block size, so kv_cache_groups must be None (use default group)"
-        )
+        assert blocks_per_chunk == 1 or all(
+            group.kv_cache_spec.block_size == block_size
+            for group in kv_cache_groups or ()
+        ), "blocks_per_chunk > 1 requires every group to use block_size"
 
         self.blocks_per_chunk: int = blocks_per_chunk
         self.block_size: int = block_size
@@ -198,6 +209,10 @@ class RequestRunner:
             disable_hybrid_kv_cache_manager=False,
         )
         vllm_config.scheduler_config.async_scheduling = async_scheduling
+        vllm_config.parallel_config.world_size = worker_count
+        vllm_config.cache_config.prefix_cache_retention_interval = retention_interval
+        if speculative_config is not None:
+            vllm_config.speculative_config = speculative_config
 
         extra_config: dict[str, Any] = {
             "spec_name": "MockOffloadingSpec",
@@ -239,13 +254,19 @@ class RequestRunner:
                 )
             ]
 
+        # Groups overlay one allocation, sized by the largest group.
+        block_stride = max(
+            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in kv_cache_groups
+        )
         kv_cache_tensors = [
             KVCacheTensor(
-                size=group.kv_cache_spec.page_size_bytes * num_gpu_blocks,
-                shared_by=[layer_name],
+                size=block_stride * num_gpu_blocks,
+                layers=list(group.layer_names),
+                layer_stride=group.kv_cache_spec.page_size_bytes * num_gpu_blocks,
+                block_stride=group.kv_cache_spec.page_size_bytes,
             )
             for group in kv_cache_groups
-            for layer_name in group.layer_names
         ]
 
         kv_cache_config = KVCacheConfig(
@@ -275,10 +296,10 @@ class RequestRunner:
         )
 
         # register worker kv_caches to enable OffloadingWorker creations
-        # set_current_vllm_config is needed for get_kv_cache_layout() to work
         kv_caches: dict[str, torch.Tensor] = {}
         for group in kv_cache_groups:
             spec = group.kv_cache_spec
+            assert isinstance(spec, AttentionSpec)
             for layer_name in group.layer_names:
                 # Shape follows FlashAttention layout:
                 # Shape: (num_blocks, 2, block_size, num_kv_heads, head_size)
@@ -301,9 +322,10 @@ class RequestRunner:
         self.scheduler_connector: OffloadingConnector = scheduler_connector
 
         # extract mocked OffloadingManager of scheduler connector
-        self.connector_scheduler = scheduler_connector.connector_scheduler
-        assert self.connector_scheduler is not None
-        manager = self.connector_scheduler.manager
+        connector_scheduler = scheduler_connector.connector_scheduler
+        assert connector_scheduler is not None
+        self.connector_scheduler = connector_scheduler
+        manager = connector_scheduler.manager
         assert isinstance(manager, MagicMock)
         self.manager: MagicMock = manager
 
@@ -355,8 +377,12 @@ class RequestRunner:
         token_ids: list[int],
         kv_transfer_params: dict | None = None,
         skip_reading_prefix_cache: bool = False,
+        req_id: str | None = None,
+        resumable: bool = False,
     ):
-        self.req_id += 1
+        if req_id is None:
+            self.req_id += 1
+            req_id = str(self.req_id)
 
         sampling_params = SamplingParams(
             max_tokens=1000,
@@ -365,11 +391,12 @@ class RequestRunner:
         sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
 
         req = Request(
-            request_id=str(self.req_id),
+            request_id=req_id,
             prompt_token_ids=token_ids,
             sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=self._block_hasher,
+            resumable=resumable,
         )
         if kv_transfer_params is not None:
             req.kv_transfer_params = kv_transfer_params
@@ -384,6 +411,7 @@ class RequestRunner:
                     self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
             else:
                 # load flush
+                assert isinstance(dst_spec, GPULoadStoreSpec)
                 for block_id in dst_spec.block_ids:
                     self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
 
@@ -396,6 +424,7 @@ class RequestRunner:
                 offload_spec = dst_spec
             else:
                 store = False
+                assert isinstance(dst_spec, GPULoadStoreSpec)
                 gpu_spec = dst_spec
                 offload_spec = src_spec
 
@@ -463,8 +492,7 @@ class RequestRunner:
         complete_transfers: bool,
         post_step_fn: Callable[[], None] | None = None,
     ):
-        """
-        Runs multiple engine (scheduler + worker) steps.
+        """Runs multiple engine (scheduler + worker) steps.
         Assumes a single request is running.
 
         Args:
@@ -472,8 +500,8 @@ class RequestRunner:
             complete_transfers: complete transfers immediately
             post_step_fn: optional callback invoked after each step's
                 update_from_output(), before the next schedule().
-        """
 
+        """
         tokens_iter = iter(decoded_tokens)
         token_id = next(tokens_iter, None)
         prev_scheduler_output = None
@@ -482,8 +510,13 @@ class RequestRunner:
             # Strict-always-False frees the request immediately on EOS, but
             # the worker may still have a deferred store queued. In production
             # the next request's step drains it; in single-request tests we
-            # must keep stepping until the scheduler sees no in-flight jobs.
-            if not self.scheduler.requests and not self.connector_scheduler._jobs:
+            # must keep stepping until the scheduler sees no in-flight jobs
+            # and no pending finished_req_ids awaiting build_connector_meta.
+            if (
+                not self.scheduler.requests
+                and not self.connector_scheduler._jobs
+                and not self.scheduler.finished_req_ids
+            ):
                 break
 
             scheduler_output = self.scheduler.schedule()
@@ -501,6 +534,7 @@ class RequestRunner:
             if complete_transfers:
                 self.offloading_spec.complete_transfers()
 
+            self.worker_connector.wait_for_save()
             finished_sending, finished_recving = self.worker_connector.get_finished(
                 scheduler_output.finished_req_ids
             )
@@ -526,6 +560,7 @@ class RequestRunner:
             if self.async_scheduling:
                 # in async scheduling we update the output of the previous step
                 if prev_model_runner_output is not None:
+                    assert prev_scheduler_output is not None
                     engine_outputs = self.scheduler.update_from_output(
                         prev_scheduler_output, prev_model_runner_output
                     )
@@ -544,19 +579,32 @@ class RequestRunner:
             if (
                 prev_token_id == EOS_TOKEN_ID
                 and prev_token_id != token_id
-                and (self.scheduler.requests or self.connector_scheduler._jobs)
+                and (
+                    self.scheduler.requests
+                    or self.connector_scheduler._jobs
+                    or self.scheduler.finished_req_ids
+                )
             ):
                 # continue for one more step to allow offloading to kick off
                 continue
 
             if token_id is None:
                 if self.async_scheduling:
-                    # sample last token
+                    # Flush the previous step's output.
+                    assert prev_scheduler_output is not None
+                    assert prev_model_runner_output is not None
                     engine_outputs = self.scheduler.update_from_output(
                         prev_scheduler_output, prev_model_runner_output
                     )
                     self._record_kv_connector_stats(engine_outputs)
-                break
+                    prev_model_runner_output = None
+                if self.scheduler.requests:
+                    # Request still running, just exhausted decoded_tokens.
+                    break
+                if not self.scheduler.finished_req_ids and (
+                    not complete_transfers or not self.connector_scheduler._jobs
+                ):
+                    break
 
         self._parse_transfers()
 
@@ -589,8 +637,7 @@ class RequestRunner:
         expected_flushed: tuple[int | tuple[int, int], ...] = (),
         post_step_fn: Callable[[], None] | None = None,
     ):
-        """
-        Runs multiple engine (scheduler + worker) steps.
+        """Runs multiple engine (scheduler + worker) steps.
         Assumes a single request is running.
 
         Args:
@@ -606,8 +653,8 @@ class RequestRunner:
             A GPU block is either a (group_idx: int, request_block_offset: int)
             or just request_block_offset: int.
             The latter case is a convenience for representing all groups.
-        """
 
+        """
         expected_stored_gpu_blocks = self._to_gpu_blocks(expected_stored)
         expected_loaded_gpu_blocks = self._to_gpu_blocks(expected_loaded)
         expected_flushed_gpu_blocks = self._to_gpu_blocks(expected_flushed)
@@ -652,6 +699,9 @@ def request_runner():
         blocks_per_chunk=1,
         kv_cache_groups=None,
         extra_config_overrides=None,
+        worker_count=1,
+        retention_interval=None,
+        speculative_config=None,
     ):
         runner = RequestRunner(
             block_size=block_size,
@@ -660,6 +710,9 @@ def request_runner():
             async_scheduling=async_scheduling,
             kv_cache_groups=kv_cache_groups,
             extra_config_overrides=extra_config_overrides,
+            worker_count=worker_count,
+            retention_interval=retention_interval,
+            speculative_config=speculative_config,
         )
         runners.append(runner)
         return runner
