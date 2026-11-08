@@ -1,0 +1,16 @@
+{
+  "topics": {
+    "code": [
+      "Write a Python function that merges two sorted lists.",
+      "Explain how a hash map resolves collisions with chaining."
+    ],
+    "math": [
+      "Solve for x: 3x + 7 = 22. Show steps.",
+      "What is the derivative of sin(x)^2 with respect to x?"
+    ],
+    "general": [
+      "Hello, how are you today?",
+      "Summarize the water cycle in two sentences."
+    ]
+  }
+}

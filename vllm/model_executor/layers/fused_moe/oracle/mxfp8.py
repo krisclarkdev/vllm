@@ -129,8 +129,15 @@ def select_mxfp8_moe_backend(
         )
         return backend, _select_kernel_cls(backend, config)
 
+    # Prefer XPU on Intel GPU before trying CUDA/ROCm backends.
+    backends = _SUPPORTED_BACKENDS
+    if current_platform.is_xpu():
+        backends = (Fp8MoeBackend.XPU,) + tuple(
+            b for b in _SUPPORTED_BACKENDS if b != Fp8MoeBackend.XPU
+        )
+
     # Auto-select: pick the first supported backend.
-    backends = prioritize_humming(list(_SUPPORTED_BACKENDS))
+    backends = prioritize_humming(list(backends))
     for backend in backends:
         try:
             experts_cls = _select_kernel_cls(backend, config)

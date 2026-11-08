@@ -32,3 +32,29 @@ steps:
       basic_correctness/memory
       --deselect="tests/basic_correctness/memory/cumem/test_cumem.py::test_basic_cumem"
       --deselect="tests/basic_correctness/memory/sleep_mode/test_sleep_mode.py::test_deep_sleep[yujiepan/mamba2-codestral-v0.1-tiny-random]"'
+
+- label: XPU Hierarchical Expert Offload
+  timeout_in_minutes: 60
+  device: intel_gpu
+  agent_tags:
+    label: production
+    gpu: 1+
+    mem: 16+
+  no_plugin: true
+  working_dir: "."
+  env:
+    REGISTRY: "public.ecr.aws/q9t5s3a7"
+    REPO: "vllm-ci-test-repo"
+    VLLM_TEST_DEVICE: "xpu"
+  source_file_dependencies:
+  - vllm/model_executor/offloader/
+  - vllm/config/offload.py
+  - tests/model_executor/offloader/
+  - tests/basic_correctness/test_hierarchical_offload.py
+  commands:
+    - >-
+      bash .buildkite/scripts/hardware_ci/run-intel-test.sh
+      'cd tests &&
+      export VLLM_WORKER_MULTIPROC_METHOD=spawn &&
+      pytest -v -s model_executor/offloader/test_hierarchical_offload.py &&
+      pytest -v -s basic_correctness/test_hierarchical_offload.py'

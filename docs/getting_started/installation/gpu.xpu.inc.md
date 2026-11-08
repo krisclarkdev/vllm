@@ -12,6 +12,37 @@ vLLM initially supports basic model inference and serving on Intel GPU platform.
 !!! warning
     The provided vllm-xpu-kernels whl is Python3.12 specific so this version is a MUST.
 
+!!! note "Custom / fork kernels"
+    This tree pins `vllm_xpu_kernels` in `requirements/xpu.txt` (default: a
+    release wheel; some development checkouts pin a git fork). Rebuild or
+    reinstall that package when you change kernel configs.
+
+    Runtime notes (enforced by the kernels package):
+
+    - **Attention fail-closed (default):** missing FA2 / paged-decode AOT
+      shapes raise instead of silently falling back to a slow PyTorch
+      reference path. For eager debug only:
+      `export VLLM_XPU_ATTN_ALLOW_FALLBACK=1` (ignored under XPUGraph
+      capture). Softcap and ALiBi are not implemented on XPU FA2 and raise
+      when requested.
+    - **Page size 128:** default decode presets may include pagesize=128
+      shapes. Serve with `--block-size 128` to use them; otherwise keep the
+      usual page-64 path.
+    - **Native MXFP8 / block-FP8 MoE (Xe2):** fused MoE uses the native
+      grouped-GEMM path by default. Escape hatches:
+      `VLLM_XPU_FUSED_MOE_NATIVE_MXFP8=0`,
+      `VLLM_XPU_FUSED_MOE_NATIVE_BLOCK_FP8=0`, or
+      `VLLM_XPU_FUSED_MOE_USE_REF=1` (force the Python reference expert
+      loop for A/B).
+    - **XPU Graph canary:** set `VLLM_XPU_ENABLE_XPU_GRAPH=1`, omit
+      `--enforce-eager`, use `--attention-backend TRITON_ATTN` and
+      `-cc.cudagraph_mode=PIECEWISE`. By default
+      `VLLM_XPU_GRAPH_FORCE_PIECEWISE=1` clamps full graph modes to
+      PIECEWISE so FlashAttention stays outside the SYCL graph (FA + FULL
+      crashes with `work_group_scratch_memory`). Set
+      `VLLM_XPU_GRAPH_FORCE_PIECEWISE=0` only for intentional FULL /
+      TRITON experiments.
+
 --8<-- [end:requirements]
 --8<-- [start:set-up-using-python]
 
@@ -71,7 +102,20 @@ pip install --upgrade pip
 pip install -v -r requirements/xpu.txt
 ```
 
-- Then, install vLLM XPU backend:
+- Then, install the correct Triton package for Intel XPU.
+
+    The default `triton` package (for NVIDIA GPUs) may be installed as a transitive dependency (e.g., via `xgrammar`). For Intel XPU, you must replace it with `triton-xpu`:
+
+    ```bash
+    pip uninstall -y triton triton-xpu
+    pip install triton-xpu==3.7.2 --extra-index-url https://download.pytorch.org/whl/xpu
+    ```
+
+    !!! note
+        - `triton` (without suffix) is for NVIDIA GPUs only. On XPU, using it instead of `triton-xpu` can cause correctness or runtime issues.
+        - For torch 2.13 (the version used in `requirements/xpu.txt`), the matching package is `triton-xpu==3.7.2`. If you use a different version of torch, check the corresponding `triton-xpu` version in [docker/Dockerfile.xpu](https://github.com/vllm-project/vllm/blob/main/docker/Dockerfile.xpu).
+        - The XPU Docker base pins oneAPI **2026.0** so SYCL Graph supports `work_group_scratch_memory` (required for FlashAttention-in-graph). Rebuild with tag `hal/vllm-xpu:oneapi-2026.0-torch2.13-<shortsha>` — do not overwrite production `kris-fork-*` tags.
+- Finally, build and install vLLM XPU backend:
 
 ```bash
 VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e . -v
