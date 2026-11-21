@@ -10,7 +10,6 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     get_target_lm_head,
     maybe_share_target_embed,
 )
-from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -43,11 +42,13 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if speculative_config.kv_cache_dtype is not None
             else vllm_config.cache_config
         ),
-        load_config=get_pp_safe_draft_load_config(get_draft_load_config(vllm_config)),
+        load_config=get_draft_load_config(vllm_config),
     )
+    draft_vllm_config = speculative_config.apply_draft_eplb_overrides(draft_vllm_config)
     # The copy above retains the target's quant_config, and VllmConfig
     # post-init re-resolves it from the retained target model_config when it is
-    # None, so the drafter's own config has to be attached after construction.
+    # None, so the drafter's own config has to be attached after construction
+    # (and after the EPLB overrides, which rebuild the config the same way).
     draft_vllm_config.quant_config = draft_quant_config
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
