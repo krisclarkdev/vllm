@@ -35,15 +35,8 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     set_triton_ptr_range,
 )
-from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
-from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-    triton_reshape_and_cache_flash,
-    triton_reshape_and_cache_flash_per_token_head_quant,
-)
-from vllm.v1.attention.ops.triton_unified_attention import (
-    MAX_3D_QUERY_LEN,
-    unified_attention,
-)
+# Lazy-import Triton attention ops — avoid Intel XPU Triton init during
+# initialize_model / before safetensors weight IO (A1 hang: load stuck at 0%).
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -52,6 +45,42 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# Keep local copy so metadata builder need not import triton ops at construct time.
+MAX_3D_QUERY_LEN = 8
+
+
+def _unified_attention(*args, **kwargs):
+    from vllm.v1.attention.ops.triton_unified_attention import (
+        unified_attention as _fn,
+    )
+
+    return _fn(*args, **kwargs)
+
+
+def _context_attention_fwd(*args, **kwargs):
+    from vllm.v1.attention.ops.triton_prefill_attention import (
+        context_attention_fwd as _fn,
+    )
+
+    return _fn(*args, **kwargs)
+
+
+def _triton_reshape_and_cache_flash(*args, **kwargs):
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash as _fn,
+    )
+
+    return _fn(*args, **kwargs)
+
+
+def _triton_reshape_and_cache_flash_per_token_head_quant(*args, **kwargs):
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash_per_token_head_quant as _fn,
+    )
+
+    return _fn(*args, **kwargs)
+
 
 
 # constants
@@ -694,7 +723,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
-        unified_attention(
+        _unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
             v=value_cache,
@@ -779,7 +808,7 @@ class TritonAttentionImpl(AttentionImpl):
         max_query_len = attn_metadata.max_query_len
 
         # Call flash attention directly on Q, K, V tensors
-        context_attention_fwd(
+        _context_attention_fwd(
             q=query,
             k=key,
             v=value,
@@ -812,7 +841,7 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
-            triton_reshape_and_cache_flash_per_token_head_quant(
+            _triton_reshape_and_cache_flash_per_token_head_quant(
                 key,
                 value,
                 key_cache,
@@ -831,7 +860,7 @@ class TritonAttentionImpl(AttentionImpl):
             value_cache = value_cache.view(self.fp8_dtype)
         if self._set_kv_ptr_range:
             set_triton_ptr_range(kv_cache, key_cache, value_cache)
-        triton_reshape_and_cache_flash(
+        _triton_reshape_and_cache_flash(
             key,
             value,
             key_cache,
