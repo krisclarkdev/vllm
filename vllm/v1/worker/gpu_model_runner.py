@@ -6242,37 +6242,110 @@ class GPUModelRunner(
             else:
                 raise e
         if self.speculative_config:
-            draft_token_ids = [[0] for _ in range(num_reqs)]
-            dummy_spec_decode_metadata = SpecDecodeMetadata.make_dummy(
-                draft_token_ids, self.device
-            )
-
-            num_tokens = sum(len(ids) for ids in draft_token_ids)
-            draft_probs = None
-            if (
-                self.speculative_config.rejection_sample_method == "standard"
-                and self.speculative_config.draft_sample_method == "probabilistic"
-            ):
-                draft_probs = torch.rand(
-                    num_tokens,
-                    logits.shape[-1],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                draft_probs = torch.softmax(draft_probs, dim=-1)
-            logits = torch.randn(
-                num_tokens + num_reqs,
-                logits.shape[-1],
-                device=self.device,
-                dtype=logits.dtype,
-            )
-            self.rejection_sampler(
-                dummy_spec_decode_metadata,
-                draft_probs,
-                logits,
-                dummy_metadata,
+            self._warmup_rejection_sampler(
+                vocab_size=logits.shape[-1],
+                logits_dtype=logits.dtype,
             )
         return sampler_output
+
+    def _warmup_rejection_sampler(
+        self,
+        vocab_size: int,
+        logits_dtype: torch.dtype,
+    ) -> None:
+        """Cover rejection_greedy_sample_kernel compile keys before jit_monitor.
+
+        Warm num_speculative_tokens and num_speculative_tokens+1 draft lengths,
+        both is_greedy_ptr=None (all_greedy) and a boolean tensor pointer, over
+        a small batch-size grid from cudagraph capture sizes.
+        """
+        assert self.speculative_config is not None
+        num_spec = int(self.speculative_config.num_speculative_tokens)
+        draft_lens = sorted({num_spec, num_spec + 1})
+
+        max_num_seqs = int(self.scheduler_config.max_num_seqs)
+        cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes or []
+        preferred = [1, 4, 8]
+        batch_sizes: list[int] = []
+        for size in list(preferred) + list(cg_sizes[:3]):
+            capped = min(int(size), max_num_seqs)
+            if capped >= 1 and capped not in batch_sizes:
+                batch_sizes.append(capped)
+        if not batch_sizes:
+            batch_sizes = [1]
+
+        need_draft_probs = (
+            self.speculative_config.rejection_sample_method == "standard"
+            and self.speculative_config.draft_sample_method == "probabilistic"
+        )
+
+        dummy_tensors = lambda n, v: torch.full((n,), v, device=self.device)
+
+        for batch_size in batch_sizes:
+            for draft_len in draft_lens:
+                draft_token_ids = [[0] * draft_len for _ in range(batch_size)]
+                metadata = SpecDecodeMetadata.make_dummy(draft_token_ids, self.device)
+                num_draft_tokens = sum(len(ids) for ids in draft_token_ids)
+
+                draft_probs = None
+                if need_draft_probs:
+                    draft_probs = torch.softmax(
+                        torch.rand(
+                            num_draft_tokens,
+                            vocab_size,
+                            device=self.device,
+                            dtype=torch.float32,
+                        ),
+                        dim=-1,
+                    )
+
+                base_sampling = SamplingMetadata(
+                    temperature=dummy_tensors(batch_size, 0.0),
+                    all_greedy=True,
+                    all_random=False,
+                    top_p=None,
+                    top_k=None,
+                    generators={},
+                    max_num_logprobs=None,
+                    logprob_token_ids=None,
+                    no_penalties=True,
+                    prompt_token_ids=None,
+                    frequency_penalties=dummy_tensors(batch_size, 0.0),
+                    presence_penalties=dummy_tensors(batch_size, 0.0),
+                    repetition_penalties=dummy_tensors(batch_size, 1.0),
+                    output_token_ids=[[] for _ in range(batch_size)],
+                    spec_token_ids=[[] for _ in range(batch_size)],
+                    allowed_token_ids_mask=None,
+                    bad_words_token_ids={},
+                    logitsprocs=LogitsProcessors(),
+                )
+
+                def _make_logits() -> torch.Tensor:
+                    return torch.randn(
+                        num_draft_tokens + batch_size,
+                        vocab_size,
+                        device=self.device,
+                        dtype=logits_dtype,
+                    )
+
+                # is_greedy_ptr is None (all-greedy metadata).
+                self.rejection_sampler(
+                    metadata,
+                    draft_probs,
+                    _make_logits(),
+                    base_sampling,
+                )
+                # Non-None is_greedy_ptr (boolean tensor specialization).
+                self.rejection_sampler(
+                    metadata,
+                    draft_probs,
+                    _make_logits(),
+                    replace(
+                        base_sampling,
+                        all_greedy=False,
+                        temperature=dummy_tensors(batch_size, 0.0),
+                    ),
+                )
 
     def _dummy_pooler_run_task(
         self,

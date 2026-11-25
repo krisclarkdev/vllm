@@ -29,6 +29,7 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
 )
+from vllm.model_executor.warmup.exl3_triton_warmup import exl3_triton_warmup
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
 )
@@ -79,7 +80,11 @@ def kernel_warmup(worker: "Worker"):
         warm_v1_block_table_kernels(
             getattr(worker.model_runner, "device", torch.device("cuda")),
             worker.scheduler_config.max_num_batched_tokens,
+            runner=worker.model_runner,
         )
+    # Soft-import EXL3 Triton fallthrough (had_in / gemm / had_out). No-op if
+    # the plugin is absent. Must run before activate_jit_monitor.
+    exl3_triton_warmup(worker)
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
