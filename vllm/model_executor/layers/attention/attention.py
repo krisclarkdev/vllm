@@ -670,6 +670,10 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
                 page_size_padded=shared_page,
+                # Preserve packing fields from the temporary customize_spec
+                # result so planners/allocators see packed C (not dense).
+                state_content_bytes=kv_cache_spec.state_content_bytes,
+                num_head_slots=kv_cache_spec.num_head_slots,
             )
         else:
             return FullAttentionSpec(
