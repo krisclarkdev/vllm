@@ -282,20 +282,13 @@ class TopKTopPSampler(nn.Module):
             return torch.multinomial(renorm_probs, num_samples=1).view(-1)
         raise RuntimeError("aiter_sample was called with no active top-k or top-p.")
 
-    def forward_xpu(
+    def _forward_xpu_kernel(
         self,
         logits: torch.Tensor,
-        generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if generators:
-            logger.warning_once(
-                "xpu kernel topk_topp_sampler does not support "
-                "per-request generators. Falling back to "
-                "PyTorch-native implementation."
-            )
-            return self.forward_native(logits, generators, k, p)
+        """XPU kernel path for rows that use the default generator (no per-req seed)."""
         random_sampled = torch.empty(
             logits.shape[0], dtype=torch.int64, device=logits.device
         )
@@ -306,9 +299,6 @@ class TopKTopPSampler(nn.Module):
         ):
             logits_to_return = torch.empty_like(logits)
 
-        assert len(generators) != logits.shape[0], (
-            "xpu kernel topk_topp_sampler does not support batch-wise generators."
-        )
         generator = torch.xpu.default_generators[logits.device.index]
 
         state = generator.get_state()
@@ -329,6 +319,70 @@ class TopKTopPSampler(nn.Module):
         offset = (offset + logits.numel() + 3) // 4 * 4
         state.view(torch.int64)[1] = offset
         generator.set_state(state)
+        return random_sampled, logits_to_return
+
+    def forward_xpu(
+        self,
+        logits: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch_size = logits.shape[0]
+        if not generators:
+            return self._forward_xpu_kernel(logits, k, p)
+
+        if len(generators) == batch_size:
+            # Every row seeded — stay on native for bit-identical seeded draws.
+            logger.debug_once(
+                "xpu kernel topk_topp_sampler does not support "
+                "per-request generators. Falling back to "
+                "PyTorch-native implementation."
+            )
+            return self.forward_native(logits, generators, k, p)
+
+        # Mixed batch: XPU for unseeded rows, native for seeded rows; stitch.
+        logger.debug_once(
+            "xpu kernel topk_topp_sampler does not support "
+            "per-request generators on all rows. Using XPU for "
+            "unseeded rows and PyTorch-native for seeded rows."
+        )
+        seeded_idx = sorted(generators.keys())
+        fast_idx = [i for i in range(batch_size) if i not in generators]
+        device = logits.device
+        seeded_idx_t = torch.tensor(seeded_idx, dtype=torch.long, device=device)
+        fast_idx_t = torch.tensor(fast_idx, dtype=torch.long, device=device)
+
+        random_sampled = torch.empty(batch_size, dtype=torch.int64, device=device)
+        need_logits = self.logprobs_mode in (
+            "processed_logits",
+            "processed_logprobs",
+        )
+        logits_to_return = torch.empty_like(logits) if need_logits else None
+
+        if fast_idx:
+            fast_k = k[fast_idx_t] if k is not None else None
+            fast_p = p[fast_idx_t] if p is not None else None
+            fast_tokens, fast_logits_out = self._forward_xpu_kernel(
+                logits[fast_idx_t], fast_k, fast_p
+            )
+            random_sampled[fast_idx_t] = fast_tokens
+            if logits_to_return is not None and fast_logits_out is not None:
+                logits_to_return[fast_idx_t] = fast_logits_out
+
+        if seeded_idx:
+            seeded_k = k[seeded_idx_t] if k is not None else None
+            seeded_p = p[seeded_idx_t] if p is not None else None
+            remapped = {
+                new_i: generators[old_i] for new_i, old_i in enumerate(seeded_idx)
+            }
+            seeded_tokens, seeded_logits_out = self.forward_native(
+                logits[seeded_idx_t], remapped, seeded_k, seeded_p
+            )
+            random_sampled[seeded_idx_t] = seeded_tokens
+            if logits_to_return is not None and seeded_logits_out is not None:
+                logits_to_return[seeded_idx_t] = seeded_logits_out
+
         return random_sampled, logits_to_return
 
 
