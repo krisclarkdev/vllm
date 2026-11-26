@@ -7,10 +7,11 @@
 | Date started | 2026-11-25 |
 | Branch | `fa2-int4-perf` (report-only commits) |
 | Audited tip | `f5e5b04386` (matches `origin/fa2-int4-upstream`) |
-| Serving | live `muse-glimmer` = `fa2-int4-m1g` @ `http://10.42.0.25:8100/v1` |
+| Serving | live `muse-glimmer` = `fa2-int4-m1g` @ `http://10.42.0.27:8100/v1` (restored Ready 1/1; was .25 during R1) |
 | Hardware | **hal B70 only** — numbers from elsewhere are void |
 | Frozen | `fa2-int4-upstream` (PR #70037) — never commit/push/rebase |
 | Fork | `krisclarkdev/vllm` only — no upstream PRs/pushes |
+| Mission status | **CONVERGED** (R5+R6: no new confirmed FA major area; no surviving untested FA-scope major hypothesis) |
 
 **Scope (FA2 ONLY):** Flash attention kernels + direct XPU dispatch — int4 KV decode inside FA2, in-kernel dequant, invocation (shapes/pages/splits) where loss is in/at FA2 boundary.
 
@@ -39,6 +40,7 @@
 | H11 | Lazy `from vllm…` imports inside `FlashAttentionImpl.forward` / `do_kv_cache_update` cost ≥10% decode (scout: imports-in-forward) | **refuted** — warm `from fa_int4 import …` 0.58 µs; ×52 = 0.030 ms = 0.013% of 233 ms ITL | 5 |
 | H12 | `ensure_int4_scale_caches` every forward (views/as_strided) costs ≥10% decode (scout) | **refuted** as major — 42.9 µs/call; ×52 = 2.23 ms = 0.96% of 233 ms ITL | 5 |
 | H13 | Triton `reshape_and_cache` int4 write every decode step is ≥10% (scout) | **OOS-confirmed-loss** — 1783 µs/call; ×52 = 92.7 ms = 39.8% of 233 ms ITL (includes single_rht(K)+single_rht(V)+pack); reshape internals OOS for FA2 audit | 5 |
+| H14 | Unexamined FA-scope ops beyond H1/H4/H12 still cost ≥10% of decode ITL | **refuted** — FA-scope budget accounts for measured path; residual is OOS MLP/MoE/sampler/spec; no surviving untested FA-scope major hyp | 6 |
 
 ---
 
@@ -111,6 +113,7 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | H10 | fp16 FA ~445 GB/s vs int4 ~1.58 GB/s same card/ctx (`/home/herdr/work/perf/results/r3-fa-bw.json`) |
 | H11 | warm import 0.58 µs → 0.013% of ITL (`/home/herdr/work/perf/results/r5-h11-h12.json`) |
 | H12 | ensure_int4_scale_caches ×52 = 0.96% of ITL (`/home/herdr/work/perf/results/r5-h11-h12.json`) |
+| H14 | FA-scope budget closed; residual OOS (`/home/herdr/work/perf/results/r6-fa-budget.json`) |
 
 **OOS (not FA kernel finding):** H13 reshape_and_cache int4 write ×52 ≈ 39.8% of 233 ms ITL — `/home/herdr/work/perf/results/r5-h13.json`.
 
@@ -171,6 +174,15 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
   - **H13:** `reshape_and_cache_int4` = 1783 µs/call; ×52 = 92.7 ms = **39.8%** of 233 ms ITL (includes single_rht(K)+single_rht(V)+pack) → **OOS-confirmed-loss** (reshape internals; one-line OOS evidence only — not an FA kernel finding)
 - **Verdict:** No new FA2 major area. H11/H12 closed. H13 parked as OOS loss outside FA2 scope.
 
+### Round 6 — H14 FA-scope budget / convergence
+
+- **Hypothesis (H14):** Unexamined FA-scope ops beyond H1/H4/H12 still cost ≥10% of decode ITL.
+- **Measure:** `/home/herdr/work/perf/results/r6-fa-budget.json` (B70, muse-glimmer image).
+  - ctx=256: cache 0.025 + RHT 1.27 + FA 0.17 ms/layer → ×52 = **76.3 ms = 32.8%** of probe ITL 233 ms; residual **157 ms = OOS** MLP/MoE/sampler/spec
+  - ctx=8192: FA-scope ×52 = **340 ms** (FA dominates; short-ctx ITL not applicable)
+- **Restore verified:** `muse-glimmer` Ready 1/1 image `fa2-int4-m1g` @ `10.42.0.27`; direct chat OK; gateway litellm coder+coordinator aliases OK.
+- **Verdict:** **H14 refuted**. No surviving untested FA-scope major hypothesis. **R5 + R6** = two consecutive rounds with no new confirmed FA major area → **LOOP CONVERGED**.
+
 ---
 
 ## Changelog
@@ -184,3 +196,4 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | 2026-11-26 | Round 4: num_splits sweep — H9 refuted (0/1 identical; >1 unsupported on FA2) |
 | 2026-11-26 | Seed H11–H13 from scout (imports-in-forward; ensure_int4_scale_caches; reshape write) as untested |
 | 2026-11-26 | Round 5: H11/H12 refuted; H13 OOS-confirmed-loss (reshape write ~40% ITL, not FA kernel) |
+| 2026-11-26 | Round 6: H14 refuted (FA-scope budget); mission **CONVERGED**; prod restore verified @ 10.42.0.27 |
