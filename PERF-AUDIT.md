@@ -36,6 +36,9 @@
 | H8 | fp32 cast in prepare/finalize is itself ≥10% | **refuted** — cast round-trip ~42 µs vs Hadamard ~650–720 µs (decomp) | 2 |
 | H9 | num_splits tuning recovers ≥10% on FA int4 decode | **refuted** — ctx=8k: splits 0/1 both ~5.31 ms; splits>1 NotImplemented on FA2 | 4 |
 | H10 | FA int4 kernel is near hardware BW/XMX limit (no headroom) | **refuted (headroom)** — same-card fp16 FA reaches ~445 GB/s at 8k while int4 stuck ~1.58 GB/s | 3 |
+| H11 | Lazy `from vllm…` imports inside `FlashAttentionImpl.forward` / `do_kv_cache_update` cost ≥10% decode (scout: imports-in-forward) | **untested** | seed |
+| H12 | `ensure_int4_scale_caches` every forward (views/as_strided) costs ≥10% decode (scout) | **untested** — R2 showed RHT dwarfs cast; cache carve not timed | seed |
+| H13 | Triton `reshape_and_cache` int4 write every decode step is ≥10% (scout) | **untested** / likely **OOS** unless it forces extra K/V passes into FA2 | seed |
 
 ---
 
@@ -167,3 +170,4 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | 2026-11-26 | Round 2: exclusive RHT microbench — H4 confirmed (~32% of ITL); H8 refuted; H6 confirmed confounder |
 | 2026-11-26 | Round 3: exclusive FA int4 vs fp16 + BW — H1 confirmed (~70× at 8k); H10 refuted headroom; H3 refined; first-to-implement = FA int4 kernel |
 | 2026-11-26 | Round 4: num_splits sweep — H9 refuted (0/1 identical; >1 unsupported on FA2) |
+| 2026-11-26 | Seed H11–H13 from scout (imports-in-forward; ensure_int4_scale_caches; reshape write) as untested |
