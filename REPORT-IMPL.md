@@ -51,23 +51,24 @@ Configs match PERF-AUDIT Round 1 seed: warm once; `--pp 512 2048 8192 --tg 128 -
 
 | Field | Value |
 |-------|-------|
-| Status | **DONE APPROX** (pod IP + svc re-confirm) |
-| Target | `http://10.42.0.27:8100/v1` (`muse-glimmer` / `fa2-int4-m1g`) |
+| Status | **DONE APPROX** |
+| Canonical target | **svc** `http://10.43.93.7:8100/v1` (`muse-glimmer` / `fa2-int4-m1g`) |
+| Superseded | pod-IP run `http://10.42.0.27:8100/v1` (job **1a**) — not for before-table |
 | Spec | **ngram ON** → numbers not comparable 1:1 to audit (audit H6: spec confounds tg) |
-| Artifacts | `/home/herdr/work/tester/results/baseline-confirm-job1.json` (+ summary); svc re-confirm also DONE APPROX per B70-QUEUE job 1 |
-| Captain | ngram-OFF redeploy deferred until first WS bench enqueue; **interim baseline = APPROX** |
+| Artifacts | `/home/herdr/work/tester/results/baseline-confirm-job1.json` (+ summary); B70-QUEUE job 1 |
+| Captain | ngram-OFF redeploy deferred until first WS bench enqueue; **interim baseline = APPROX (svc)** |
 
 | Workload | ctx | batch | pp tok/s | tg tok/s | vs audit | notes |
 |----------|-----|-------|----------|----------|----------|-------|
-| pp512/tg128 | 0 | 1 | **2442±5** | **31.13±0.25** | audit pp~3235 (Δ−793); tg~16.9 (Δ+14.2) | APPROX (ngram ON) |
-| pp512/tg128 | 8192 | 1 | **614** | **12.85±4.08** | audit tg~19 (Δ−6.2); runs 16.93 / 8.77 noisy | APPROX |
+| pp512/tg128 | 0 | 1 | **1783** | **30.38±7.66** | audit pp~3235; tg~16.9 | **canonical svc**; APPROX |
+| pp512/tg128 | 8192 | 1 | **610** | **15.17±4.48** | audit tg~19 | **canonical svc**; run values 10.7 / 19.6 |
 
-### Before (baseline — interim = JOB1 APPROX; strict OFF re-bench later)
+### Before (baseline — interim = JOB1 APPROX svc; strict OFF re-bench later)
 
 | Workload | ctx | batch | pp tok/s | tg tok/s | ttfr ms | notes |
 |----------|-----|-------|----------|----------|---------|-------|
-| pp512/tg128 | 0 | 1 | 2442±5 | 31.13±0.25 | — | JOB1 APPROX |
-| pp512/tg128 | 8192 | 1 | 614 | 12.85±4.08 | — | JOB1 APPROX; noisy |
+| pp512/tg128 | 0 | 1 | 1783 | 30.38±7.66 | — | JOB1 APPROX svc |
+| pp512/tg128 | 8192 | 1 | 610 | 15.17±4.48 | — | JOB1 APPROX svc; values 10.7/19.6 |
 
 ### After (post-impl — fill per keep decision)
 
@@ -86,3 +87,4 @@ Configs match PERF-AUDIT Round 1 seed: warm once; `--pp 512 2048 8192 --tg 128 -
 | 2026-11-26 | Board + WS stubs created on `fa2-int4-perf` |
 | 2026-11-26 | Scout DIAGNOSE linked; WS1/WS2/WS3 Diagnose → done (REPORT-WS* summaries) |
 | 2026-11-26 | JOB1 baseline confirm **APPROX** (ngram ON); interim before-table filled; OFF redeploy deferred |
+| 2026-11-26 | JOB1 canonical = **svc** BASE 10.43.93.7 (pod-IP 1a superseded) |
