@@ -12,6 +12,7 @@
 | Hardware | **hal B70 only** |
 | Spec decode | **OFF** for all GPU profile / correct / benchy |
 | Audit evidence | [`PERF-AUDIT.md`](./PERF-AUDIT.md) |
+| Scout diagnose | [`DIAGNOSE-fa2-impl.md`](./DIAGNOSE-fa2-impl.md) (WS2/WS3 call graphs + WS1 pointer); WS1 detail [`DIAGNOSE-WS1.md`](./DIAGNOSE-WS1.md) |
 
 **First-to-implement (from audit):** Rank 1 = FA int4 `paged_decode M1` (long-ctx); Rank 2 = XPU RHT / Hadamard (short-ctx). H13 reshape write is OOS for FA kernel audit but is WS3 product scope.
 
@@ -21,9 +22,9 @@
 
 | WS | Tree / writer | Scope | Diagnose | Design | Impl | Test | Bench |
 |----|---------------|-------|----------|--------|------|------|-------|
-| **WS1** | `vllm-xpu-kernels` / coder-ws1 | int4 `paged_decode M1` → adapt fp16 path + int4 dequant front-end | pending | pending | pending | pending | pending |
-| **WS2** | `vllm` (`fa2-int4-perf`) / coder-ws2 | native XPU Hadamard for Q/out; kill host butterfly + fp32 cast | pending | pending | pending | pending | pending |
-| **WS3** | `vllm` (separate worktree) / coder-ws3 | fused `reshape_and_cache_int4` native op | pending | pending | pending | pending | pending |
+| **WS1** | `vllm-xpu-kernels` / coder-ws1 | int4 `paged_decode M1` → adapt fp16 path + int4 dequant front-end | done | pending | pending | pending | pending |
+| **WS2** | `vllm` (`fa2-int4-perf`) / coder-ws2 | native XPU Hadamard for Q/out; kill host butterfly + fp32 cast | done | pending | pending | pending | pending |
+| **WS3** | `vllm` (separate worktree) / coder-ws3 | fused `reshape_and_cache_int4` native op | done | pending | pending | pending | pending |
 | Hadamard-spec | shared design only / arch | one rotation spec both WS2+WS3 implement | — | pending | — | — | — |
 
 Per-WS detail: [`REPORT-WS1.md`](./REPORT-WS1.md) · [`REPORT-WS2.md`](./REPORT-WS2.md) · [`REPORT-WS3.md`](./REPORT-WS3.md)
@@ -66,3 +67,4 @@ Configs match PERF-AUDIT Round 1 seed: warm once; `--pp 512 2048 8192 --tg 128 -
 | When | What |
 |------|------|
 | 2026-11-26 | Board + WS stubs created on `fa2-int4-perf` |
+| 2026-11-26 | Scout DIAGNOSE linked; WS1/WS2/WS3 Diagnose → done (REPORT-WS* summaries) |
