@@ -34,6 +34,7 @@
 | H6 | Spec/ngram confounds e2e tg vs pure FA step time | **confirmed (metrics confounder)** — not a FA kernel loss; explains benchy tg=16.9 (≈59 ms) vs probe ITL 233 ms / RHT 75 ms paradox | 2 |
 | H7 | FA int4 requires block_size%64==0 (`FA_INT4_BLOCK_SIZE=64`) — layout constraint | noted (fact); not separately timed as ≥10% loss | 3 |
 | H8 | fp32 cast in prepare/finalize is itself ≥10% | **refuted** — cast round-trip ~42 µs vs Hadamard ~650–720 µs (decomp) | 2 |
+| H9 | num_splits tuning recovers ≥10% on FA int4 decode | **refuted** — ctx=8k: splits 0/1 both ~5.31 ms; splits>1 NotImplemented on FA2 | 4 |
 | H10 | FA int4 kernel is near hardware BW/XMX limit (no headroom) | **refuted (headroom)** — same-card fp16 FA reaches ~445 GB/s at 8k while int4 stuck ~1.58 GB/s | 3 |
 
 ---
@@ -103,6 +104,7 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | ID | Killed by |
 |----|-----------|
 | H8 | cast 42 µs vs Hadamard ~700 µs (`/home/herdr/work/perf/results/r2-rht-decomp.json`) |
+| H9 | splits 0/1 identical; >1 unsupported (`/home/herdr/work/perf/results/r4-num-splits-out.txt`) |
 | H10 | fp16 FA ~445 GB/s vs int4 ~1.58 GB/s same card/ctx (`/home/herdr/work/perf/results/r3-fa-bw.json`) |
 
 ## First-to-implement pick
@@ -148,6 +150,12 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 
 - **Verdict:** **H1 confirmed** — FA int4 decode kernel is the long-ctx rock; **not** HBM-limited (**H10 refuted headroom**). **H3 refined**. Short-ctx: H4 > H1.
 
+### Round 4 — H9 num_splits
+
+- **Hypothesis:** num_splits choice leaves ≥10% on the table for FA int4 decode.
+- **Measure:** ctx=8192 int4 FA; num_splits 0→5.308 ms, 1→5.309 ms; >1 raises `NotImplementedError('FA2 does not support num_splits > 1')`. Artifact: `/home/herdr/work/perf/results/r4-num-splits-out.txt`.
+- **Verdict:** **H9 refuted**. No new major area.
+
 ---
 
 ## Changelog
@@ -158,3 +166,4 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | 2026-11-26 | Round 1 baseline: benchy R1 JSON + non-invasive prefill/decode split; H2/H5 confirmed; H1 deferred pending captain profile window |
 | 2026-11-26 | Round 2: exclusive RHT microbench — H4 confirmed (~32% of ITL); H8 refuted; H6 confirmed confounder |
 | 2026-11-26 | Round 3: exclusive FA int4 vs fp16 + BW — H1 confirmed (~70× at 8k); H10 refuted headroom; H3 refined; first-to-implement = FA int4 kernel |
+| 2026-11-26 | Round 4: num_splits sweep — H9 refuted (0/1 identical; >1 unsupported on FA2) |
