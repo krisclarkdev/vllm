@@ -3,7 +3,7 @@
 Date: 2026-11-26  
 Tree: `/home/herdr/work/coder/vllm-ws3`  
 Branch: `fa2-int4-perf-ws3`  
-Status: **ready for B70 queue** (byte-compat test needs XPU/Triton; not run on this host)
+Status: **fp16 byte-compat fix ready** — soft IEEE RTNE roundtrip; re-queue JOB2b
 
 ## What landed
 
@@ -21,7 +21,9 @@ Single-pass Triton writer on XPU: **RHT(K/V) → asymmetric int4 quant → nibbl
 
 - Signs: seed `0x9E3779B9`, round 0 (same `_get_rht_signs`)
 - Forward: `y = H (D₁ ⊙ x)`, fp32 butterfly, **no** per-stage `1/√2`
-- After RHT: cast via input dtype (fp16/bf16) then quant — matches unfused round-trip
+- After RHT: dtype roundtrip then quant — bf16 via `.to(tl.bfloat16)`; **fp16 via
+  c10 `fp16_ieee_from_fp32_value` soft RTNE** (XPU `.to(tl.float16)` was not
+  PyTorch-exact; JOB2b fp16 fail / bf16 pass)
 - Layout: unchanged C=136 / separate K,V uint8 + scale caches (FA views untouched)
 - Did **not** edit `fa_int4.py` (WS2) or `vllm-xpu-kernels`
 

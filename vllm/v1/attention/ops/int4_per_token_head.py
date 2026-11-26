@@ -80,17 +80,55 @@ def _fwht_unnormalized(x, offs, LOG2_D: tl.constexpr):
 
 
 @triton.jit
-def _rht_forward_vec(x, signs, offs, LOG2_D: tl.constexpr, ROUNDTRIP: tl.constexpr):
-    """Forward single-RHT: y = H (D₁ ⊙ x), fp32 butterfly; optional dtype RT.
+def _rht_forward_vec(x, signs, offs, LOG2_D: tl.constexpr):
+    """Forward single-RHT: y = H (D₁ ⊙ x), fp32 butterfly (no dtype RT)."""
+    return _fwht_unnormalized(x * signs, offs, LOG2_D)
 
-    ROUNDTRIP: 0 = keep fp32; 1 = cast via fp16; 2 = cast via bf16 — matches
-    `single_rht(x.float()).to(orig_dtype)` before the unfused pack kernel.
+
+@triton.jit
+def _round_fp32_to_fp16_as_fp32(f):
+    """Bit-exact `f.to(fp16).float()` via c10 `fp16_ieee_from_fp32_value`.
+
+    XPU Triton's in-register `.to(tl.float16)` is not PyTorch-RTNE-exact; this
+    integer/fp32 algorithm matches the unfused `single_rht(...).to(fp16)` path.
     """
-    x = _fwht_unnormalized(x * signs, offs, LOG2_D)
+    scale_to_inf = tl.full(f.shape, 0x77800000, tl.int32).to(
+        tl.float32, bitcast=True
+    )
+    scale_to_zero = tl.full(f.shape, 0x08800000, tl.int32).to(
+        tl.float32, bitcast=True
+    )
+    w = f.to(tl.uint32, bitcast=True)
+    abs_f = (f.to(tl.int32, bitcast=True) & 0x7FFFFFFF).to(
+        tl.float32, bitcast=True
+    )
+    base = (abs_f * scale_to_inf) * scale_to_zero
+    shl1_w = w + w
+    sign = w & 0x80000000
+    bias = shl1_w & 0xFF000000
+    bias = tl.maximum(bias, tl.full(f.shape, 0x71000000, tl.uint32))
+    bias_f = ((bias >> 1) + 0x07800000).to(tl.float32, bitcast=True)
+    base = bias_f + base
+    bits = base.to(tl.uint32, bitcast=True)
+    exp_bits = (bits >> 13) & 0x00007C00
+    mantissa_bits = bits & 0x00000FFF
+    nonsign = exp_bits + mantissa_bits
+    nan_bits = tl.full(f.shape, 0x7E00, tl.uint32)
+    half = tl.where(shl1_w > 0xFF000000, nan_bits, nonsign)
+    h16 = ((sign >> 16) | half).to(tl.uint16)
+    return h16.to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _dtype_roundtrip(x, ROUNDTRIP: tl.constexpr):
+    """Match `y.to(dtype).float()` after fp32 RHT (unfused pack input).
+
+    ROUNDTRIP: 0 = keep fp32; 1 = fp16 (soft IEEE RTNE); 2 = bf16.
+    """
     if ROUNDTRIP == 1:
-        x = x.to(tl.float16).to(tl.float32)
-    elif ROUNDTRIP == 2:
-        x = x.to(tl.bfloat16).to(tl.float32)
+        return _round_fp32_to_fp16_as_fp32(x)
+    if ROUNDTRIP == 2:
+        return x.to(tl.bfloat16).to(tl.float32)
     return x
 
 
@@ -393,8 +431,11 @@ def _reshape_cache_int4_fused_rht_kernel(
 
     key_base = key_ptr + tok * stride_key_tok + head * stride_key_head
     k_raw = tl.load(key_base + offs, mask=head_mask, other=0.0).to(tl.float32)
-    k_rot = _rht_forward_vec(
-        tl.where(head_mask, k_raw, 0.0), signs, offs, LOG2_HEAD, ROUNDTRIP
+    k_rot = _dtype_roundtrip(
+        _rht_forward_vec(
+            tl.where(head_mask, k_raw, 0.0), signs, offs, LOG2_HEAD
+        ),
+        ROUNDTRIP,
     )
 
     half_offs = tl.arange(0, PACKED_HEAD_PADDED)
@@ -427,8 +468,11 @@ def _reshape_cache_int4_fused_rht_kernel(
     val_base = value_ptr + tok * stride_val_tok + head * stride_val_head
     v_raw = tl.load(val_base + offs, mask=head_mask_v, other=0.0).to(tl.float32)
     # V uses the same D₁ / H as K (head_size_v == head_size on the fused path).
-    v_rot = _rht_forward_vec(
-        tl.where(head_mask_v, v_raw, 0.0), signs, offs, LOG2_HEAD, ROUNDTRIP
+    v_rot = _dtype_roundtrip(
+        _rht_forward_vec(
+            tl.where(head_mask_v, v_raw, 0.0), signs, offs, LOG2_HEAD
+        ),
+        ROUNDTRIP,
     )
 
     half_v = head_size_v // 2
