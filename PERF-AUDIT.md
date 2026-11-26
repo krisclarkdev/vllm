@@ -36,9 +36,9 @@
 | H8 | fp32 cast in prepare/finalize is itself ≥10% | **refuted** — cast round-trip ~42 µs vs Hadamard ~650–720 µs (decomp) | 2 |
 | H9 | num_splits tuning recovers ≥10% on FA int4 decode | **refuted** — ctx=8k: splits 0/1 both ~5.31 ms; splits>1 NotImplemented on FA2 | 4 |
 | H10 | FA int4 kernel is near hardware BW/XMX limit (no headroom) | **refuted (headroom)** — same-card fp16 FA reaches ~445 GB/s at 8k while int4 stuck ~1.58 GB/s | 3 |
-| H11 | Lazy `from vllm…` imports inside `FlashAttentionImpl.forward` / `do_kv_cache_update` cost ≥10% decode (scout: imports-in-forward) | **untested** | seed |
-| H12 | `ensure_int4_scale_caches` every forward (views/as_strided) costs ≥10% decode (scout) | **untested** — R2 showed RHT dwarfs cast; cache carve not timed | seed |
-| H13 | Triton `reshape_and_cache` int4 write every decode step is ≥10% (scout) | **untested** / likely **OOS** unless it forces extra K/V passes into FA2 | seed |
+| H11 | Lazy `from vllm…` imports inside `FlashAttentionImpl.forward` / `do_kv_cache_update` cost ≥10% decode (scout: imports-in-forward) | **refuted** — warm `from fa_int4 import …` 0.58 µs; ×52 = 0.030 ms = 0.013% of 233 ms ITL | 5 |
+| H12 | `ensure_int4_scale_caches` every forward (views/as_strided) costs ≥10% decode (scout) | **refuted** as major — 42.9 µs/call; ×52 = 2.23 ms = 0.96% of 233 ms ITL | 5 |
+| H13 | Triton `reshape_and_cache` int4 write every decode step is ≥10% (scout) | **OOS-confirmed-loss** — 1783 µs/call; ×52 = 92.7 ms = 39.8% of 233 ms ITL (includes single_rht(K)+single_rht(V)+pack); reshape internals OOS for FA2 audit | 5 |
 
 ---
 
@@ -109,6 +109,10 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | H8 | cast 42 µs vs Hadamard ~700 µs (`/home/herdr/work/perf/results/r2-rht-decomp.json`) |
 | H9 | splits 0/1 identical; >1 unsupported (`/home/herdr/work/perf/results/r4-num-splits-out.txt`) |
 | H10 | fp16 FA ~445 GB/s vs int4 ~1.58 GB/s same card/ctx (`/home/herdr/work/perf/results/r3-fa-bw.json`) |
+| H11 | warm import 0.58 µs → 0.013% of ITL (`/home/herdr/work/perf/results/r5-h11-h12.json`) |
+| H12 | ensure_int4_scale_caches ×52 = 0.96% of ITL (`/home/herdr/work/perf/results/r5-h11-h12.json`) |
+
+**OOS (not FA kernel finding):** H13 reshape_and_cache int4 write ×52 ≈ 39.8% of 233 ms ITL — `/home/herdr/work/perf/results/r5-h13.json`.
 
 ## First-to-implement pick
 
@@ -159,6 +163,14 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 - **Measure:** ctx=8192 int4 FA; num_splits 0→5.308 ms, 1→5.309 ms; >1 raises `NotImplementedError('FA2 does not support num_splits > 1')`. Artifact: `/home/herdr/work/perf/results/r4-num-splits-out.txt`.
 - **Verdict:** **H9 refuted**. No new major area.
 
+### Round 5 — H11/H12/H13 scout seeds (B70 co-tenant in muse-glimmer)
+
+- **Measure:** Co-tenant after prod restore. Artifacts: `/home/herdr/work/perf/results/r5-h11-h12.json`, `/home/herdr/work/perf/results/r5-h13.json`.
+  - **H11:** warm `from fa_int4 import …` = 0.58 µs; ×52 = 0.030 ms = **0.013%** of 233 ms ITL → **refuted**
+  - **H12:** `ensure_int4_scale_caches` = 42.9 µs/call; ×52 = 2.23 ms = **0.96%** of 233 ms ITL → **refuted** as major (≥10%)
+  - **H13:** `reshape_and_cache_int4` = 1783 µs/call; ×52 = 92.7 ms = **39.8%** of 233 ms ITL (includes single_rht(K)+single_rht(V)+pack) → **OOS-confirmed-loss** (reshape internals; one-line OOS evidence only — not an FA kernel finding)
+- **Verdict:** No new FA2 major area. H11/H12 closed. H13 parked as OOS loss outside FA2 scope.
+
 ---
 
 ## Changelog
@@ -171,3 +183,4 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | 2026-11-26 | Round 3: exclusive FA int4 vs fp16 + BW — H1 confirmed (~70× at 8k); H10 refuted headroom; H3 refined; first-to-implement = FA int4 kernel |
 | 2026-11-26 | Round 4: num_splits sweep — H9 refuted (0/1 identical; >1 unsupported on FA2) |
 | 2026-11-26 | Seed H11–H13 from scout (imports-in-forward; ensure_int4_scale_caches; reshape write) as untested |
+| 2026-11-26 | Round 5: H11/H12 refuted; H13 OOS-confirmed-loss (reshape write ~40% ITL, not FA kernel) |
