@@ -26,13 +26,15 @@
 
 | ID | Hypothesis | Status | Round |
 |----|------------|--------|-------|
-| H1 | Decode tg gap vs fp8 FA is mostly **inside FA int4 kernel / in-kernel dequant** | untested (exclusive FA-kernel timer next) | 1 |
+| H1 | Decode tg gap vs fp8 FA is mostly **inside FA int4 kernel / in-kernel dequant** | **confirmed (refined)** — int4 FA ~70× slower than fp16 FA at ctx=8k on same B70; ~1.5 GB/s vs ~445 GB/s implied; dominates long-ctx. Short-ctx dominated by H4 not H1. | 3 |
 | H2 | Prefill q_len>1 is Triton int4, not FA2 | **confirmed** | 1 |
-| H3 | Long-context decode slowdown is KV BW / dequant traffic scaling with ctx | **lean confirmed** (R1 benchy) | 1 |
+| H3 | Long-context decode slowdown is KV BW / dequant traffic scaling with ctx | **confirmed (refined)** — scales with ctx via FA int4 kernel time, but **not** near hardware BW (refuted as HBM-limit); implementation-bound | 1+3 |
 | H4 | RHT(Q)+inv-RHT(out) around FA decode is a **≥10%** decode tax | **confirmed** — exclusive XPU: ~1.45 ms/layer ×52 ≈ 75 ms/step; ~32% of probe ITL 233 ms; at ctx=256 RHT ≫ FA (~71 vs ~10 ms×52) | 2 |
 | H5 | Concurrency>1 does not recover fp8-like per-stream tg at long ctx | **confirmed** | 1 |
 | H6 | Spec/ngram confounds e2e tg vs pure FA step time | **confirmed (metrics confounder)** — not a FA kernel loss; explains benchy tg=16.9 (≈59 ms) vs probe ITL 233 ms / RHT 75 ms paradox | 2 |
+| H7 | FA int4 requires block_size%64==0 (`FA_INT4_BLOCK_SIZE=64`) — layout constraint | noted (fact); not separately timed as ≥10% loss | 3 |
 | H8 | fp32 cast in prepare/finalize is itself ≥10% | **refuted** — cast round-trip ~42 µs vs Hadamard ~650–720 µs (decomp) | 2 |
+| H10 | FA int4 kernel is near hardware BW/XMX limit (no headroom) | **refuted (headroom)** — same-card fp16 FA reaches ~445 GB/s at 8k while int4 stuck ~1.58 GB/s | 3 |
 
 ---
 
@@ -91,19 +93,21 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 
 | Rank | Mechanism | File / fn | Evidence | Gain range | Effort | Risk |
 |------|-----------|-----------|----------|------------|--------|------|
-| 1 | **XPU RHT uses tier-3 butterfly + fp32 cast around every FA decode layer** | `fa_int4.py` `prepare_fa_int4_query`/`finalize_fa_int4_output`; `int4_per_token_head.fast_hadamard_transform` | R2 exclusive ~75 ms/52 layers (~32% of 233 ms ITL); ≫ FA at ctx=256 — `/home/herdr/work/perf/results/r2-rht-microbench-xpu-exclusive.json`, `r2-rht-decomp.json` | **Short-ctx: ~15–30% step** if native XPU Hadamard / fuse into FA; long-ctx dilutes | med | med (must match RHT basis) |
-| 2 | Prefill is Triton not FA2 (routing) | `fa_int4.run_int4_triton_attention` | R1 | n/a for FA kernel | — | — |
-| 3 | Long-ctx + conc collapse (product behavior; FA kernel share still open) | serving / KV traffic | R1 benchy | follows FA kernel once measured | — | — |
+| 1 | **FA int4 paged decode kernel (M1) far below fp16 FA / HBM** — in-kernel int4 path ~70× slower at 8k; ~1.5 GB/s implied | `vllm_xpu_kernels` `flash_attn_varlen_func` / `int4 paged_decode M1`; dispatch `flash_attn.py` | R3 exclusive microbench int4 vs fp16 — `/home/herdr/work/perf/results/r3-fa-kernel.json`, `/home/herdr/work/perf/results/r3-fa-bw.json` | **Long-ctx: 2–10×+ decode** if int4 FA reaches even ~10–20% of fp16 FA efficiency; short-ctx smaller | high (kernel) | high (numerics/layout) |
+| 2 | **XPU RHT uses tier-3 butterfly + fp32 cast around every FA decode layer** | `fa_int4.py` `prepare_fa_int4_query`/`finalize_fa_int4_output`; `int4_per_token_head.fast_hadamard_transform` | R2 exclusive ~75 ms/52 layers (~32% of 233 ms ITL); ≫ FA at ctx=256 — `/home/herdr/work/perf/results/r2-rht-microbench-xpu-exclusive.json`, `/home/herdr/work/perf/results/r2-rht-decomp.json` | **Short-ctx: ~15–30% step** if native XPU Hadamard / fuse into FA; long-ctx dilutes to <10% of attn time | med | med (must match RHT basis) |
+| 3 | Prefill is Triton not FA2 (routing) | `fa_int4.run_int4_triton_attention` | R1 | n/a for FA kernel | — | — |
+| 4 | Long-ctx + conc collapse (product of #1) | serving / KV traffic | R1 benchy | follows #1 | — | — |
 
 ## Refuted
 
 | ID | Killed by |
 |----|-----------|
 | H8 | cast 42 µs vs Hadamard ~700 µs (`/home/herdr/work/perf/results/r2-rht-decomp.json`) |
+| H10 | fp16 FA ~445 GB/s vs int4 ~1.58 GB/s same card/ctx (`/home/herdr/work/perf/results/r3-fa-bw.json`) |
 
 ## First-to-implement pick
 
-**Rank 1 — XPU Hadamard / fuse RHT into FA decode** for short-ctx TPS. Long-ctx FA int4 kernel share still unmeasured (H1) — next round.
+**Rank 1 — optimize / replace FA int4 paged_decode M1** (or fuse dequant into a BW-capable FA). Long-ctx and concurrency pain are this kernel. RHT (rank 2) is the right first fix only if the product priority is **short-ctx decode TPS**; for 8k–32k Muse capacity wins, fix the FA int4 kernel first.
 
 ---
 
@@ -129,6 +133,21 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 - **Agent moves:** none (no Glimmer-tier fleet seats). Log: `AGENT-MOVE-LOG.md`.
 - **Verdict:** **H4 confirmed** major area. **H8 refuted**. **H6 confirmed** as e2e confounder (not a kernel fix target).
 
+### Round 3 — H1 FA int4 kernel vs fp16 / BW
+
+- **Survey:** Decode uses `flash_attn_varlen_func` with int4 pages + `k_descale`/`v_descale` (ESIMD page-attn requires head_size==256 — Muse D=128 skips it). Kernel enforces `block_size % 64 == 0` (`FA_INT4_BLOCK_SIZE=64`); error text names **`int4 paged_decode M1`**.
+- **Hypothesis (H1):** Gap vs fp8/fp16 is mostly in-kernel int4 dequant / FA int4 decode implementation.
+- **Measure (exclusive):** `r3_fa_kernel_microbench.py`, `r3_fa_bw_check.py`. Artifacts: `/home/herdr/work/perf/results/r3-fa-kernel.json`, `/home/herdr/work/perf/results/r3-fa-bw.json`. nkv=8, block=64, C=136.
+
+| ctx | ms int4 FA/layer | ms fp16 FA/layer | int4/fp16 | int4 GB/s | fp16 GB/s | RHT ms×52 | FA int4 ms×52 |
+|-----|------------------|------------------|-----------|-----------|-----------|-----------|---------------|
+| 256 | 0.17–0.19 | 0.059 | ~2.9× | ~1.5 | ~18 | ~71 | ~10 |
+| 2048 | 1.33–1.47 | 0.037 | ~36× | ~1.57 | ~228 | ~79 | ~76 |
+| 8192 | 5.30–5.87 | 0.075 | **~70×** | **~1.58** | **~445** | ~79 | ~305 |
+| 32768 | 37.2 | — | — | ~0.90 | — | ~67 | ~1933 |
+
+- **Verdict:** **H1 confirmed** — FA int4 decode kernel is the long-ctx rock; **not** HBM-limited (**H10 refuted headroom**). **H3 refined**. Short-ctx: H4 > H1.
+
 ---
 
 ## Changelog
@@ -138,3 +157,4 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 | 2026-11-25 | Initial skeleton on `fa2-int4-perf` (docs worktree) |
 | 2026-11-26 | Round 1 baseline: benchy R1 JSON + non-invasive prefill/decode split; H2/H5 confirmed; H1 deferred pending captain profile window |
 | 2026-11-26 | Round 2: exclusive RHT microbench — H4 confirmed (~32% of ITL); H8 refuted; H6 confirmed confounder |
+| 2026-11-26 | Round 3: exclusive FA int4 vs fp16 + BW — H1 confirmed (~70× at 8k); H10 refuted headroom; H3 refined; first-to-implement = FA int4 kernel |
