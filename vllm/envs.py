@@ -344,6 +344,10 @@ if TYPE_CHECKING:
     # Opt into slow PyTorch attention when an XPU FA2 shape is missing.
     # Default (unset/0) is fail-closed in vllm-xpu-kernels.
     VLLM_XPU_ATTN_ALLOW_FALLBACK: bool = False
+    # FA2 XPU int4-KV in-kernel path (greenfield). Default 0 keeps PR #15
+    # Triton route for int4_per_token_head. Set 1 only when vllm-xpu-kernels
+    # reports FA_INT4_AVAILABLE and FA views/wiring are present.
+    VLLM_XPU_FA_INT4: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2274,6 +2278,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_ATTN_ALLOW_FALLBACK": lambda: bool(
         int(os.getenv("VLLM_XPU_ATTN_ALLOW_FALLBACK", "0"))
     ),
+    "VLLM_XPU_FA_INT4": lambda: bool(int(os.getenv("VLLM_XPU_FA_INT4", "0"))),
     # Kernel backend for INC weight-only intN (WNA16) linear layers on XPU.
     # "auto" keeps the default preference order (ARK when importable, else the
     # oneDNN w4a16 path). "ark" forces the auto_round_kernel backend, "w4a16"
