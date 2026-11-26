@@ -296,6 +296,143 @@ def test_reshape_and_cache_per_token_head(
 
 
 # ===========================================================================
+# 2b. Fused INT4 reshape (RHT+quant+pack) byte-compat vs unfused reference
+# ===========================================================================
+def _tier3_single_rht_forward(x: torch.Tensor) -> torch.Tensor:
+    """fp32 Walsh–Hadamard + D₁ signs (DESIGN §1); ignores Hadacore/MMA tiers."""
+    from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
+
+    orig_dtype = x.dtype
+    y = x.float()
+    d = y.shape[-1]
+    d1 = _get_rht_signs(d, 0, y.device)
+    y = y * d1
+    h = 1
+    while h < d:
+        xv = y.view(*y.shape[:-1], d // (2 * h), 2, h)
+        a = xv[..., 0, :]
+        b = xv[..., 1, :]
+        y = torch.stack([a + b, a - b], dim=-2).reshape(y.shape)
+        h <<= 1
+    return y.to(orig_dtype)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7])
+@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("seed", SEEDS)
+@torch.inference_mode()
+def test_reshape_and_cache_int4_fused_byte_compat(
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    seed: int,
+):
+    """Fused writer cache bytes must equal tier-3 RHT + pack (C=136)."""
+    from vllm.v1.attention.ops.int4_per_token_head import (
+        _INT4_PACKING_FACTOR,
+        _can_fuse_reshape_int4,
+        _reshape_cache_int4_kernel,
+        _run_reshape_kernel,
+        reshape_and_cache_int4_fused,
+        reshape_and_cache_int4_unfused,
+    )
+
+    if not _can_fuse_reshape_int4(
+        torch.empty(1, 1, head_size), torch.empty(1, 1, head_size)
+    ):
+        pytest.skip("fused path requires power-of-two head size")
+
+    set_random_seed(seed)
+    torch.set_default_device(DEVICE_TYPE)
+    block_size = 16
+    num_blocks = (num_tokens + block_size - 1) // block_size + 4
+    cache_hs = head_size // 2
+
+    key = torch.randn(num_tokens, num_heads, head_size, dtype=dtype)
+    value = torch.randn(num_tokens, num_heads, head_size, dtype=dtype)
+    num_slots = block_size * num_blocks
+    slot_mapping = torch.tensor(
+        random.sample(range(num_slots), num_tokens), dtype=torch.long
+    )
+
+    def _empty_caches():
+        kc = torch.zeros(
+            num_blocks, block_size, num_heads, cache_hs, dtype=torch.uint8
+        )
+        vc = torch.zeros_like(kc)
+        ks = torch.zeros(num_blocks, block_size, num_heads, dtype=torch.float32)
+        vs = torch.zeros_like(ks)
+        return kc, vc, ks, vs
+
+    ref_kc, ref_vc, ref_ks, ref_vs = _empty_caches()
+    _run_reshape_kernel(
+        _reshape_cache_int4_kernel,
+        key=_tier3_single_rht_forward(key),
+        value=_tier3_single_rht_forward(value),
+        key_cache=ref_kc,
+        value_cache=ref_vc,
+        k_scale_cache=ref_ks,
+        v_scale_cache=ref_vs,
+        slot_mapping=slot_mapping,
+        packing_factor=_INT4_PACKING_FACTOR,
+    )
+
+    fused_kc, fused_vc, fused_ks, fused_vs = _empty_caches()
+    reshape_and_cache_int4_fused(
+        key,
+        value,
+        fused_kc,
+        fused_vc,
+        slot_mapping,
+        k_scale_cache=fused_ks,
+        v_scale_cache=fused_vs,
+    )
+
+    for slot in slot_mapping.tolist():
+        blk = slot // block_size
+        off = slot % block_size
+        assert torch.equal(fused_kc[blk, off], ref_kc[blk, off])
+        assert torch.equal(fused_vc[blk, off], ref_vc[blk, off])
+        assert torch.equal(
+            fused_ks[blk, off].view(torch.int32),
+            ref_ks[blk, off].view(torch.int32),
+        )
+        assert torch.equal(
+            fused_vs[blk, off].view(torch.int32),
+            ref_vs[blk, off].view(torch.int32),
+        )
+
+    # On XPU the product unfused path is the same tier-3 reference.
+    if current_platform.is_xpu():
+        unf_kc, unf_vc, unf_ks, unf_vs = _empty_caches()
+        reshape_and_cache_int4_unfused(
+            key,
+            value,
+            unf_kc,
+            unf_vc,
+            slot_mapping,
+            k_scale_cache=unf_ks,
+            v_scale_cache=unf_vs,
+        )
+        for slot in slot_mapping.tolist():
+            blk = slot // block_size
+            off = slot % block_size
+            assert torch.equal(fused_kc[blk, off], unf_kc[blk, off])
+            assert torch.equal(fused_vc[blk, off], unf_vc[blk, off])
+            assert torch.equal(
+                fused_ks[blk, off].view(torch.int32),
+                unf_ks[blk, off].view(torch.int32),
+            )
+            assert torch.equal(
+                fused_vs[blk, off].view(torch.int32),
+                unf_vs[blk, off].view(torch.int32),
+            )
+
+
+# ===========================================================================
 # 3. Per-token-head round-trip accuracy (quantize -> dequantize)
 # ===========================================================================
 @pytest.mark.parametrize("num_tokens", [1, 16])

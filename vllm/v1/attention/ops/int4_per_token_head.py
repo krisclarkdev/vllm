@@ -65,6 +65,85 @@ def unpack_int4_nibbles(packed):
 
 
 @triton.jit
+def _fwht_unnormalized(x, offs, LOG2_D: tl.constexpr):
+    """In-register unnormalized Walsh–Hadamard (H @ H = D I), last-dim vector.
+
+    Matches the tier-3 PyTorch butterfly in `fast_hadamard_transform`
+    (no 1/√2 per stage). `offs` must be `tl.arange(0, 1 << LOG2_D)`.
+    """
+    for stage in tl.static_range(LOG2_D):
+        bmask = 1 << stage
+        pval = tl.gather(x, (offs ^ bmask).to(tl.int32), 0)
+        sign = tl.where((offs & bmask) == 0, 1.0, -1.0).to(tl.float32)
+        x = sign * x + pval
+    return x
+
+
+@triton.jit
+def _rht_forward_vec(x, signs, offs, LOG2_D: tl.constexpr, ROUNDTRIP: tl.constexpr):
+    """Forward single-RHT: y = H (D₁ ⊙ x), fp32 butterfly; optional dtype RT.
+
+    ROUNDTRIP: 0 = keep fp32; 1 = cast via fp16; 2 = cast via bf16 — matches
+    `single_rht(x.float()).to(orig_dtype)` before the unfused pack kernel.
+    """
+    x = _fwht_unnormalized(x * signs, offs, LOG2_D)
+    if ROUNDTRIP == 1:
+        x = x.to(tl.float16).to(tl.float32)
+    elif ROUNDTRIP == 2:
+        x = x.to(tl.bfloat16).to(tl.float32)
+    return x
+
+
+@triton.jit
+def _asym_int4_quant_and_pack(even, odd, even_mask, odd_mask):
+    """Asymmetric int4 quant + nibble pack; returns (packed_u8, scale_packed)."""
+    vmin = tl.minimum(
+        tl.min(tl.where(even_mask, even, float("inf"))),
+        tl.min(tl.where(odd_mask, odd, float("inf"))),
+    )
+    vmax = tl.maximum(
+        tl.max(tl.where(even_mask, even, float("-inf"))),
+        tl.max(tl.where(odd_mask, odd, float("-inf"))),
+    )
+    scale = tl.maximum((vmax - vmin) / 15.0, 1e-6)
+    zp_f = tl.clamp(
+        tl.where(
+            -vmin / scale >= 0,
+            (-vmin / scale + 0.5).to(tl.int32),
+            (-vmin / scale - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+    inv = 1.0 / scale
+    even_s = even * inv + zp_f
+    odd_s = odd * inv + zp_f
+    even_q = tl.clamp(
+        tl.where(
+            even_s >= 0,
+            (even_s + 0.5).to(tl.int32),
+            (even_s - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+    odd_q = tl.clamp(
+        tl.where(
+            odd_s >= 0,
+            (odd_s + 0.5).to(tl.int32),
+            (odd_s - 0.5).to(tl.int32),
+        ).to(tl.float32),
+        0.0,
+        15.0,
+    )
+    zp_int = zp_f.to(tl.int32)
+    scale_bits = scale.to(tl.int32, bitcast=True)
+    scale_packed = ((scale_bits & -16) | (zp_int & 0xF)).to(tl.float32, bitcast=True)
+    packed = pack_int4_nibbles(even_q.to(tl.uint8), odd_q.to(tl.uint8))
+    return packed, scale_packed
+
+
+@triton.jit
 def _reshape_cache_int4_kernel(
     key_ptr,
     value_ptr,
@@ -258,6 +337,127 @@ def _reshape_cache_int4_kernel(
     )
 
 
+@triton.jit
+def _reshape_cache_int4_fused_rht_kernel(
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
+    slot_mapping_ptr,
+    signs_ptr,
+    stride_key_tok: tl.int64,
+    stride_key_head: tl.int64,
+    stride_val_tok: tl.int64,
+    stride_val_head: tl.int64,
+    stride_kc_blk: tl.int64,
+    stride_kc_slot: tl.int64,
+    stride_kc_head: tl.int64,
+    stride_vc_blk: tl.int64,
+    stride_vc_slot: tl.int64,
+    stride_vc_head: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    block_size: tl.constexpr,
+    head_size: tl.constexpr,
+    head_size_v: tl.constexpr,
+    LOG2_HEAD: tl.constexpr,
+    ROUNDTRIP: tl.constexpr,
+    PACKED_HEAD_PADDED: tl.constexpr,
+):
+    """Single-pass RHT → asymmetric int4 quant → C=136 pack/store.
+
+    Device-side forward RHT matches `single_rht` (H (D₁ ⊙ x), fp32 butterfly,
+    signs round 0). Quant/pack matches `_reshape_cache_int4_kernel`.
+    """
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+
+    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
+    if slot < 0:
+        return
+
+    blk = slot // block_size
+    slot_in_blk = slot % block_size
+
+    HEAD_PAD: tl.constexpr = 1 << LOG2_HEAD
+    offs = tl.arange(0, HEAD_PAD)
+    head_mask = offs < head_size
+    head_mask_v = offs < head_size_v
+    signs = tl.load(signs_ptr + offs, mask=offs < head_size, other=1.0)
+
+    key_base = key_ptr + tok * stride_key_tok + head * stride_key_head
+    k_raw = tl.load(key_base + offs, mask=head_mask, other=0.0).to(tl.float32)
+    k_rot = _rht_forward_vec(
+        tl.where(head_mask, k_raw, 0.0), signs, offs, LOG2_HEAD, ROUNDTRIP
+    )
+
+    half_offs = tl.arange(0, PACKED_HEAD_PADDED)
+    half_k = head_size // 2
+    even_k_mask = (half_offs * 2) < head_size
+    odd_k_mask = (half_offs * 2 + 1) < head_size
+    k_even = tl.gather(k_rot, (half_offs * 2).to(tl.int32), 0)
+    k_odd = tl.gather(k_rot, (half_offs * 2 + 1).to(tl.int32), 0)
+    k_packed, k_scale_packed = _asym_int4_quant_and_pack(
+        k_even, k_odd, even_k_mask, odd_k_mask
+    )
+
+    tl.store(
+        k_scale_cache_ptr
+        + blk * stride_ks_blk
+        + slot_in_blk * stride_ks_slot
+        + head * stride_ks_head,
+        k_scale_packed,
+    )
+    tl.store(
+        key_cache_ptr
+        + blk * stride_kc_blk
+        + slot_in_blk * stride_kc_slot
+        + head * stride_kc_head
+        + half_offs,
+        k_packed,
+        mask=half_offs < half_k,
+    )
+
+    val_base = value_ptr + tok * stride_val_tok + head * stride_val_head
+    v_raw = tl.load(val_base + offs, mask=head_mask_v, other=0.0).to(tl.float32)
+    # V uses the same D₁ / H as K (head_size_v == head_size on the fused path).
+    v_rot = _rht_forward_vec(
+        tl.where(head_mask_v, v_raw, 0.0), signs, offs, LOG2_HEAD, ROUNDTRIP
+    )
+
+    half_v = head_size_v // 2
+    even_v_mask = (half_offs * 2) < head_size_v
+    odd_v_mask = (half_offs * 2 + 1) < head_size_v
+    v_even = tl.gather(v_rot, (half_offs * 2).to(tl.int32), 0)
+    v_odd = tl.gather(v_rot, (half_offs * 2 + 1).to(tl.int32), 0)
+    v_packed, v_scale_packed = _asym_int4_quant_and_pack(
+        v_even, v_odd, even_v_mask, odd_v_mask
+    )
+
+    tl.store(
+        v_scale_cache_ptr
+        + blk * stride_vs_blk
+        + slot_in_blk * stride_vs_slot
+        + head * stride_vs_head,
+        v_scale_packed,
+    )
+    tl.store(
+        value_cache_ptr
+        + blk * stride_vc_blk
+        + slot_in_blk * stride_vc_slot
+        + head * stride_vc_head
+        + half_offs,
+        v_packed,
+        mask=half_offs < half_v,
+    )
+
+
 def _run_reshape_kernel(
     kernel,
     *,
@@ -309,6 +509,89 @@ def _run_reshape_kernel(
         block_size=key_cache.shape[1],
         head_size=head_size,
         head_size_v=head_size_v,
+        PACKED_HEAD_PADDED=packed_padded,
+        num_warps=num_warps,
+    )
+
+
+def _roundtrip_kind(dtype: torch.dtype) -> int:
+    if dtype == torch.float16:
+        return 1
+    if dtype == torch.bfloat16:
+        return 2
+    return 0
+
+
+def _can_fuse_reshape_int4(key: torch.Tensor, value: torch.Tensor) -> bool:
+    """Fused path needs equal power-of-two head dims (Muse: 128)."""
+    hs, hsv = key.shape[-1], value.shape[-1]
+    return hs == hsv and largest_power_of_2_divisor(hs) == hs
+
+
+def _should_use_fused_reshape_int4(key: torch.Tensor, value: torch.Tensor) -> bool:
+    """XPU product path: one launch RHT+quant+pack. CUDA keeps unfused."""
+    return current_platform.is_xpu() and _can_fuse_reshape_int4(key, value)
+
+
+def _run_reshape_kernel_fused(
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Launch fused RHT + INT4 reshape (no separate single_rht stage)."""
+    num_tokens, num_kv_heads, head_size = key.shape
+    head_size_v = value.shape[2]
+    assert _can_fuse_reshape_int4(key, value)
+    assert key.dtype == value.dtype, (
+        f"fused int4 reshape requires key/value same dtype, "
+        f"got {key.dtype} vs {value.dtype}"
+    )
+    packing_factor = _INT4_PACKING_FACTOR
+    packed_padded = triton.next_power_of_2(
+        max(head_size, head_size_v) // packing_factor
+    )
+    log2_head = head_size.bit_length() - 1
+    signs = _get_rht_signs(head_size, 0, key.device)
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        num_warps = 4
+    else:
+        num_warps = min(16, max(1, packed_padded // 32))
+
+    _reshape_cache_int4_fused_rht_kernel[(num_tokens, num_kv_heads)](
+        key_ptr=key,
+        value_ptr=value,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        k_scale_cache_ptr=k_scale_cache,
+        v_scale_cache_ptr=v_scale_cache,
+        slot_mapping_ptr=slot_mapping,
+        signs_ptr=signs,
+        stride_key_tok=key.stride(0),
+        stride_key_head=key.stride(1),
+        stride_val_tok=value.stride(0),
+        stride_val_head=value.stride(1),
+        stride_kc_blk=key_cache.stride(0),
+        stride_kc_slot=key_cache.stride(1),
+        stride_kc_head=key_cache.stride(2),
+        stride_vc_blk=value_cache.stride(0),
+        stride_vc_slot=value_cache.stride(1),
+        stride_vc_head=value_cache.stride(2),
+        stride_ks_blk=k_scale_cache.stride(0),
+        stride_ks_slot=k_scale_cache.stride(1),
+        stride_ks_head=k_scale_cache.stride(2),
+        stride_vs_blk=v_scale_cache.stride(0),
+        stride_vs_slot=v_scale_cache.stride(1),
+        stride_vs_head=v_scale_cache.stride(2),
+        block_size=key_cache.shape[1],
+        head_size=head_size,
+        head_size_v=head_size_v,
+        LOG2_HEAD=log2_head,
+        ROUNDTRIP=_roundtrip_kind(key.dtype),
         PACKED_HEAD_PADDED=packed_padded,
         num_warps=num_warps,
     )
@@ -877,7 +1160,7 @@ def _launch_packed_attn(
 # ----------------------------------------------------------------------
 
 
-def reshape_and_cache_int4(
+def reshape_and_cache_int4_unfused(
     key: torch.Tensor,
     value: torch.Tensor,
     key_cache: torch.Tensor,
@@ -887,7 +1170,7 @@ def reshape_and_cache_int4(
     k_scale_cache: torch.Tensor,
     v_scale_cache: torch.Tensor,
 ) -> None:
-    """Pre-rotate (RHT), pack to INT4 and write into the paged cache."""
+    """Reference writer: `single_rht` then separate INT4 pack kernel."""
     key = single_rht(key.float()).to(key.dtype)
     value = single_rht(value.float()).to(value.dtype)
     _run_reshape_kernel(
@@ -900,6 +1183,71 @@ def reshape_and_cache_int4(
         v_scale_cache=v_scale_cache,
         slot_mapping=slot_mapping,
         packing_factor=_INT4_PACKING_FACTOR,
+    )
+
+
+def reshape_and_cache_int4_fused(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+) -> None:
+    """Single-pass device RHT + INT4 quant/pack (C=136 byte-compatible)."""
+    if not _can_fuse_reshape_int4(key, value):
+        raise ValueError(
+            "fused reshape_and_cache_int4 requires equal power-of-two "
+            f"head dims, got key={key.shape[-1]} value={value.shape[-1]}"
+        )
+    _run_reshape_kernel_fused(
+        key=key,
+        value=value,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        k_scale_cache=k_scale_cache,
+        v_scale_cache=v_scale_cache,
+        slot_mapping=slot_mapping,
+    )
+
+
+def reshape_and_cache_int4(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+) -> None:
+    """Pre-rotate (RHT), pack to INT4 and write into the paged cache.
+
+    On XPU with power-of-two head size, uses one fused Triton launch
+    (RHT→quant→pack). Otherwise keeps the unfused `single_rht` + pack path
+    (CUDA Hadacore / Triton Hadamard reference).
+    """
+    if _should_use_fused_reshape_int4(key, value):
+        reshape_and_cache_int4_fused(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
+        )
+        return
+    reshape_and_cache_int4_unfused(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale_cache=k_scale_cache,
+        v_scale_cache=v_scale_cache,
     )
 
 
