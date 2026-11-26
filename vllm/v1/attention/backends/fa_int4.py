@@ -43,12 +43,15 @@ def prepare_fa_int4_query(
     KV pages are written with ``reshape_and_cache_int4`` which applies the
     same forward RHT before INT4 pack. FA decode dequants in that rotated
     basis, so Q must be rotated too (and the output inverse-rotated).
+
+    On XPU, ``single_rht`` uses a dense fp32 Hadamard GEMM (no tier-3
+    host-launched butterfly). ``rht_norm = b`` (not √b); see DESIGN §1.
     """
     from vllm.utils.math_utils import largest_power_of_2_divisor
     from vllm.v1.attention.ops.int4_per_token_head import single_rht
 
     q_dtype = query.dtype
-    q_rot = single_rht(query.float()).to(q_dtype)
+    q_rot = single_rht(query)
     rht_norm = float(largest_power_of_2_divisor(query.shape[-1]))
     return q_rot, softmax_scale / rht_norm, rht_norm, q_dtype
 
@@ -61,7 +64,8 @@ def finalize_fa_int4_output(
     """Inverse RHT on attention output (Triton ``unified_attention_int4``)."""
     from vllm.v1.attention.ops.int4_per_token_head import single_rht
 
-    out_f = single_rht(output.float(), inverse=True) / rht_norm
+    # Inv-RHT in fp32 accumulate then / rht_norm (calibrated INT4 scale).
+    out_f = single_rht(output, inverse=True).float() / rht_norm
     output.copy_(out_f.to(q_dtype))
 
 
