@@ -26,12 +26,13 @@
 
 | ID | Hypothesis | Status | Round |
 |----|------------|--------|-------|
-| H1 | Decode tg gap vs fp8 FA (≥~2× at short ctx) is mostly **inside FA int4 kernel / in-kernel dequant**, not scheduler/sampler | untested (need exclusive XPU FA-kernel timer) | 1 |
-| H2 | Prefill q_len>1 is **Triton int4**, not FA2 — FA2 not on prefill critical path | **confirmed (routing)**; prefill loss OOS for FA2 | 1 |
-| H3 | Long-context decode slowdown is **KV BW / dequant traffic** scaling with ctx, not fixed per-step overhead | **lean confirmed** (tg falls with ctx; conc=4 collapses at 32k) | 1 |
-| H4 | RHT(Q)+inv-RHT(out) around FA decode is a **≥10%** decode tax | untested | 1+ |
-| H5 | Concurrency>1 does not recover fp8-like per-stream tg at long ctx (still BW-bound) | **confirmed** at 32k (c=4 tg≈1.0–1.5) | 1 |
-| H6 | Spec/ngram decode confounds e2e tg vs pure FA step time | open (metrics show spec counters active) | 1 |
+| H1 | Decode tg gap vs fp8 FA is mostly **inside FA int4 kernel / in-kernel dequant** | untested (exclusive FA-kernel timer next) | 1 |
+| H2 | Prefill q_len>1 is Triton int4, not FA2 | **confirmed** | 1 |
+| H3 | Long-context decode slowdown is KV BW / dequant traffic scaling with ctx | **lean confirmed** (R1 benchy) | 1 |
+| H4 | RHT(Q)+inv-RHT(out) around FA decode is a **≥10%** decode tax | **confirmed** — exclusive XPU: ~1.45 ms/layer ×52 ≈ 75 ms/step; ~32% of probe ITL 233 ms; at ctx=256 RHT ≫ FA (~71 vs ~10 ms×52) | 2 |
+| H5 | Concurrency>1 does not recover fp8-like per-stream tg at long ctx | **confirmed** | 1 |
+| H6 | Spec/ngram confounds e2e tg vs pure FA step time | **confirmed (metrics confounder)** — not a FA kernel loss; explains benchy tg=16.9 (≈59 ms) vs probe ITL 233 ms / RHT 75 ms paradox | 2 |
+| H8 | fp32 cast in prepare/finalize is itself ≥10% | **refuted** — cast round-trip ~42 µs vs Hadamard ~650–720 µs (decomp) | 2 |
 
 ---
 
@@ -90,16 +91,19 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 
 | Rank | Mechanism | File / fn | Evidence | Gain range | Effort | Risk |
 |------|-----------|-----------|----------|------------|--------|------|
-| 1 | Prefill is Triton int4, not FA2 — FA2 audit must not chase prefill tok/s as FA kernel win | `fa_int4.py` `run_int4_triton_attention`; `flash_attn.py` q_len>1 branch | code + metrics prefill≈e2e on 1-tok completion | n/a (routing fact); unblocks correct focus on **decode** | — | — |
-| 2 | Long-ctx + concurrency: e2e decode throughput collapses (BW-bound product behavior) | serving path / KV traffic (FA int4 decode reads packed pages) | c=4 @32k tg 1.0–1.5 vs c=1 tg 2.3–7.9; ctx0 c=4 scales to 46.6 | if FA/dequant BW improved, headroom largest at long ctx | high | med |
+| 1 | **XPU RHT uses tier-3 butterfly + fp32 cast around every FA decode layer** | `fa_int4.py` `prepare_fa_int4_query`/`finalize_fa_int4_output`; `int4_per_token_head.fast_hadamard_transform` | R2 exclusive ~75 ms/52 layers (~32% of 233 ms ITL); ≫ FA at ctx=256 — `/home/herdr/work/perf/results/r2-rht-microbench-xpu-exclusive.json`, `r2-rht-decomp.json` | **Short-ctx: ~15–30% step** if native XPU Hadamard / fuse into FA; long-ctx dilutes | med | med (must match RHT basis) |
+| 2 | Prefill is Triton not FA2 (routing) | `fa_int4.run_int4_triton_attention` | R1 | n/a for FA kernel | — | — |
+| 3 | Long-ctx + conc collapse (product behavior; FA kernel share still open) | serving / KV traffic | R1 benchy | follows FA kernel once measured | — | — |
 
 ## Refuted
 
-*(none yet as major-area kernel claims — H1 still untested at FA-kernel granularity)*
+| ID | Killed by |
+|----|-----------|
+| H8 | cast 42 µs vs Hadamard ~700 µs (`/home/herdr/work/perf/results/r2-rht-decomp.json`) |
 
 ## First-to-implement pick
 
-*(deferred — Round 1 is baseline. Next measure should falsify H1/H4 with FA-kernel vs surrounding timers; ask captain for exclusive GPU profile window.)*
+**Rank 1 — XPU Hadamard / fuse RHT into FA decode** for short-ctx TPS. Long-ctx FA int4 kernel share still unmeasured (H1) — next round.
 
 ---
 
@@ -114,6 +118,17 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 - **Measure:** Full matrix JSON `exl3-sc/benchy-FA2-PERF-R1.json` (18 cells, 32k no OOM). Step probes `perf/results/r1-step-breakdown.json`. No product-code edits; no exclusive profile
 - **Verdict:** **baseline** — e2e table established. Short-ctx decode ~⅓ of fp8 tg; short prefill faster than fp8. FA-kernel share of decode still unknown. No new implementable FA2 major area confirmed at kernel level this round
 
+### Round 2 — H4 RHT tax (exclusive B70)
+
+- **Survey:** `prepare_fa_int4_query` / `finalize_fa_int4_output` wrap every FA decode layer (`flash_attn.py` ~1254–1290). Both call `single_rht`; on XPU `fast_hadamard_transform` falls through to **tier-3 PyTorch butterfly** (Hadacore CUDA-only; Triton Hadamard gated on `x.is_cuda`).
+- **Hypothesis (H4):** RHT(Q)+inv-RHT(out) costs ≥10% of decode step because XPU uses host-launched butterfly + fp32 cast, ×52 layers.
+- **Measure (exclusive):** Scaled `muse-glimmer`→0; pod `fa2-perf-probe` same image `fa2-int4-m1g`. Scripts: `r2_rht_microbench_v2.py`, `r2_rht_decomp.py`. Artifacts: `/home/herdr/work/perf/results/r2-rht-microbench-xpu-exclusive.json`, `/home/herdr/work/perf/results/r2-rht-decomp.json`.
+  - tok=1 prepare+finalize: **~1446 µs/layer** (event); stack52 **~75.5 ms**
+  - vs probe ITL 233 ms → **~32%**; vs noisy benchy 59 ms → >100% (reconcile via H6)
+  - decomp: prepare-like 767 µs; had_fp32 719 µs; cast 42 µs; torch.compile can cut prepare-like to 276 µs (still ~14 ms×52)
+- **Agent moves:** none (no Glimmer-tier fleet seats). Log: `AGENT-MOVE-LOG.md`.
+- **Verdict:** **H4 confirmed** major area. **H8 refuted**. **H6 confirmed** as e2e confounder (not a kernel fix target).
+
 ---
 
 ## Changelog
@@ -122,3 +137,4 @@ Non-invasive only (prod stayed up; **no exclusive XPU profile**). Probes after m
 |------|------|
 | 2026-11-25 | Initial skeleton on `fa2-int4-perf` (docs worktree) |
 | 2026-11-26 | Round 1 baseline: benchy R1 JSON + non-invasive prefill/decode split; H2/H5 confirmed; H1 deferred pending captain profile window |
+| 2026-11-26 | Round 2: exclusive RHT microbench — H4 confirmed (~32% of ITL); H8 refuted; H6 confirmed confounder |
