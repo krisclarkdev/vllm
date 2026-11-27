@@ -1604,8 +1604,11 @@ def single_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
         return single_rht(x.reshape(*lead, d // block, block), inverse).reshape(
             *lead, d
         )
-    d1 = _get_rht_signs(d, 0, x.device)
+    # Signs are cached as fp32 ±1; cast to x.dtype so (fp16|bf16) Q is not
+    # promoted before FA2 (XPU TORCH_CHECK rejects float32 query).
+    d1 = _get_rht_signs(d, 0, x.device).to(dtype=x.dtype)
     if inverse:
-        return fast_hadamard_transform(x) * d1
+        y = fast_hadamard_transform(x) * d1
     else:
-        return fast_hadamard_transform(x * d1)
+        y = fast_hadamard_transform(x * d1)
+    return y if y.dtype == x.dtype else y.to(x.dtype)
