@@ -52,8 +52,10 @@ def prepare_fa_int4_query(
 
     q_dtype = query.dtype
     q_rot = single_rht(query)
+    # Defensive: keep FA2 query dtype even if single_rht ever promotes
+    # (fp16/bf16 Q * fp32 RHT signs → fp32; XPU FA rejects float32 query).
     rht_norm = float(largest_power_of_2_divisor(query.shape[-1]))
-    return q_rot, softmax_scale / rht_norm, rht_norm, q_dtype
+    return q_rot.to(q_dtype), softmax_scale / rht_norm, rht_norm, q_dtype
 
 
 def finalize_fa_int4_output(
