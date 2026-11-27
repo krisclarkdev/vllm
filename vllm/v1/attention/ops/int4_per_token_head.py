@@ -12,6 +12,7 @@ kernel, the RHT transform, and the public `reshape_and_cache_int4` /
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -31,15 +32,33 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     softmax_step,
     store_segm_reduce_scalars,
 )
-from vllm.v1.attention.ops.triton_unified_attention import (
-    kv_tile_alignment,
-    reduce_segments,
-)
+from vllm.v1.attention.ops.triton_unified_attention import reduce_segments
 
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 # 2 x int4 packed per storage byte.
 _INT4_PACKING_FACTOR = 2
+
+
+def _kv_tile_alignment(k: torch.Tensor, v: torch.Tensor) -> tuple[int, int, int]:
+    """Alignment of per-token-head K/V tile loads, which Triton cannot infer.
+
+    Vendored locally so older muse vllm (missing
+    ``triton_unified_attention.kv_tile_alignment``) still imports this module.
+
+    Returns:
+        `(k_align, v_align, v_delta)`: the powers of two, at most 16, dividing
+        the K address and strides, and also the V strides and `v_delta`, the
+        offset of `v` from `k`. `v_align` is 1 unless `v` starts inside `k`.
+
+    """
+    if k.element_size() != 1:
+        return 1, 1, 0
+    k_align = math.gcd(16, k.data_ptr(), *k.stride()[:3])
+    v_delta = v.data_ptr() - k.data_ptr()
+    if not 0 < v_delta < k.stride(0) * k.shape[0]:
+        return k_align, 1, 0
+    return k_align, math.gcd(k_align, v_delta, *v.stride()[:3]), v_delta
 
 
 # ----------------------------------------------------------------------
@@ -1107,7 +1126,7 @@ def _launch_packed_attn(
         grid = (total_num_q_blocks, num_kv_heads)
         tile_size = TILE_SIZE_PREFILL
 
-    k_align, v_align, v_cache_delta = kv_tile_alignment(k_cache, v_cache)
+    k_align, v_align, v_cache_delta = _kv_tile_alignment(k_cache, v_cache)
 
     _attn_packed[grid](
         output_ptr=out,
