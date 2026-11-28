@@ -1061,6 +1061,19 @@ def _hadamard_mma_kernel(
 # (32 KiB) leaves room for input + accumulator.  Larger D falls back.
 _TRITON_HADAMARD_MIN_D = 16
 _TRITON_HADAMARD_MAX_D = 128
+# Dense XPU GEMM fallback. Muse needs d=128; also cover 64/256.
+_XPU_HADAMARD_MAX_D = 256
+# None = unprobed; True/False after first XPU Triton attempt (or init warm).
+_TRITON_HADAMARD_XPU_OK: bool | None = None
+
+
+def _is_cuda_or_xpu_tensor(x: torch.Tensor) -> bool:
+    """True for CUDA or XPU device tensors (Triton tier-2 candidates)."""
+    if x.is_cuda:
+        return True
+    if getattr(x, "is_xpu", False):
+        return True
+    return x.device.type == "xpu"
 
 
 def _triton_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
@@ -1095,15 +1108,11 @@ def _triton_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     return out2d.reshape(orig_shape).to(orig_dtype)
 
 
-# XPU dense Hadamard (one GEMM). Muse needs d=128; also cover 64/256.
-_XPU_HADAMARD_MAX_D = 256
-
-
 def _dense_fp32_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     """Unnormalized WHT via cached dense H in fp32 (device GEMM).
 
-    Matches the Sylvester / tier-3 butterfly algebra (H @ H = d I). Used on
-    XPU to replace the multi-launch PyTorch butterfly (PERF-AUDIT H4).
+    Matches the Sylvester / butterfly algebra (H @ H = d I). Fallback when
+    Triton MMA is unavailable / fails on XPU (DESIGN-rht-xpu-r2 pick A).
     """
     d = x.shape[-1]
     orig_shape = x.shape
@@ -1115,7 +1124,7 @@ def _dense_fp32_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
 
 
 def _butterfly_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
-    """Tier-4 PyTorch butterfly reference (CPU / fallback)."""
+    """Tier-last PyTorch butterfly reference (CPU / final fallback)."""
     d = x.shape[-1]
     h = 1
     while h < d:
@@ -1133,12 +1142,14 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
 
     H_d × x where H_d × H_d = d × I.  Last dim must be a power of 2.
 
-    Dispatch:
+    Dispatch ladder (DESIGN-rht-xpu-r2):
       1. Hadacore CUDA Tensor Core kernel (sm_80+).
-      2. Triton MMA matmul kernel (CUDA fallback + ROCm MFMA/WMMA path).
-      3. XPU dense fp32 matmul (standalone native path; DESIGN §3 / WS2).
-      4. PyTorch butterfly (CPU and any remaining fallback).
+      2. Triton MMA (CUDA **or** XPU; d∈[16,128], fp16/bf16/fp32).
+         On Triton miss/compile fail → fall through.
+      3. Dense XPU GEMM ``x @ cached_H`` (fp32 accumulate).
+      4. PyTorch butterfly (CPU / anything left).
     """
+    global _TRITON_HADAMARD_XPU_OK
     d = x.shape[-1]
     assert d & (d - 1) == 0, f"Requires power-of-2 dim, got {d}"
 
@@ -1159,16 +1170,23 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
         y_bf16 = ops.hadacore_transform(x_bf16, inplace=True)
         return y_bf16.to(orig_dtype) * rescale
 
-    # Tier 2 — Triton MMA kernel (covers ROCm via MFMA/WMMA codegen, and
-    # also CUDA when hadacore is unavailable).
-    if (
-        x.is_cuda
-        and _TRITON_HADAMARD_MIN_D <= d <= _TRITON_HADAMARD_MAX_D
-        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ):
-        return _triton_hadamard_transform(x)
+    # Tier 2 — Triton MMA (CUDA / ROCm path, and XPU Round-2 pick A).
+    triton_ok_dtype = x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    triton_ok_d = _TRITON_HADAMARD_MIN_D <= d <= _TRITON_HADAMARD_MAX_D
+    if _is_cuda_or_xpu_tensor(x) and triton_ok_d and triton_ok_dtype:
+        skip_xpu = x.device.type == "xpu" and _TRITON_HADAMARD_XPU_OK is False
+        if not skip_xpu:
+            try:
+                y = _triton_hadamard_transform(x)
+                if x.device.type == "xpu":
+                    _TRITON_HADAMARD_XPU_OK = True
+                return y
+            except Exception:
+                if x.device.type == "xpu":
+                    _TRITON_HADAMARD_XPU_OK = False
+                # Fall through to dense / butterfly.
 
-    # Tier 3 — XPU dense fp32 GEMM (kill host-launched butterfly stages).
+    # Tier 3 — dense XPU GEMM fallback (also covers d>128 up to max).
     if (
         x.device.type == "xpu"
         and _TRITON_HADAMARD_MIN_D <= d <= _XPU_HADAMARD_MAX_D
@@ -1206,11 +1224,24 @@ def _get_rht_signs(d: int, round_idx: int, device: torch.device) -> torch.Tensor
 
 
 def init_rht_signs(head_size: int, device: torch.device) -> None:
-    """Pre-build RHT signs (and XPU Hadamard H) so no forward takes a cold miss."""
+    """Pre-build RHT signs (+ warm Triton/dense H on XPU; JIT probe)."""
+    global _TRITON_HADAMARD_XPU_OK
     b = largest_power_of_2_divisor(head_size)
     _get_rht_signs(b, 0, device)
-    if device.type == "xpu" and _TRITON_HADAMARD_MIN_D <= b <= _XPU_HADAMARD_MAX_D:
-        _get_hadamard_matrix(b, torch.float32, device)
+    if device.type != "xpu" or not (
+        _TRITON_HADAMARD_MIN_D <= b <= _XPU_HADAMARD_MAX_D
+    ):
+        return
+    for dt in (torch.float16, torch.bfloat16, torch.float32):
+        _get_hadamard_matrix(b, dt, device)
+    if b > _TRITON_HADAMARD_MAX_D or _TRITON_HADAMARD_XPU_OK is False:
+        return
+    try:
+        probe = torch.zeros(1, b, dtype=torch.float16, device=device)
+        _triton_hadamard_transform(probe)
+        _TRITON_HADAMARD_XPU_OK = True
+    except Exception:
+        _TRITON_HADAMARD_XPU_OK = False
 
 
 def single_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
@@ -1219,10 +1250,10 @@ def single_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     Used by INT4 per-token-head quantization to gaussianize data
     before asymmetric quantization.
 
-    Forward: ``H (D₁ ⊙ x)``. Inverse: ``D₁ ⊙ (H x)``. Butterfly / dense
-    WHT accumulate in fp32; result matches ``x.dtype`` (DESIGN §1).
+    Forward: ``H (D₁ ⊙ x)``. Inverse: ``D₁ ⊙ (H x)``. Keeps ``x.dtype``
+    on the hot path (no host ``.float()``) so Triton-XPU stays fp16/bf16
+    (DESIGN-rht-xpu-r2 / §1).
     """
-    orig_dtype = x.dtype
     d = x.shape[-1]
     block = largest_power_of_2_divisor(d)
     if block < d:
@@ -1234,11 +1265,10 @@ def single_rht(x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
         return single_rht(x.reshape(*lead, d // block, block), inverse).reshape(
             *lead, d
         )
-    d1 = _get_rht_signs(d, 0, x.device)
-    # Signs are fp32 ±1; promote once, run WHT in fp32, cast back.
-    x_f = x if x.dtype == torch.float32 else x.float()
+    # Signs are cached as fp32 ±1; cast to x.dtype so Q is not promoted.
+    d1 = _get_rht_signs(d, 0, x.device).to(dtype=x.dtype)
     if inverse:
-        y = fast_hadamard_transform(x_f) * d1
+        y = fast_hadamard_transform(x) * d1
     else:
-        y = fast_hadamard_transform(x_f * d1)
-    return y if y.dtype == orig_dtype else y.to(orig_dtype)
+        y = fast_hadamard_transform(x * d1)
+    return y if y.dtype == x.dtype else y.to(x.dtype)
